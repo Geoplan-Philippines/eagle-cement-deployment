@@ -1,0 +1,116 @@
+# ---------------------------------------------------------------------------
+# Eagle Cement deployment configuration
+#
+# Copy to /etc/eagle-cement/deploy.conf and edit. Every value below is a
+# default that the script already uses, so you only need to keep the lines you
+# actually change.
+#
+#   sudo install -d -m 755 /etc/eagle-cement
+#   sudo cp eagle-cement.conf.example /etc/eagle-cement/deploy.conf
+#   sudo chmod 600 /etc/eagle-cement/deploy.conf
+#
+# This file is sourced by bash. Quote anything with spaces.
+# ---------------------------------------------------------------------------
+
+# --- where the code comes from ---------------------------------------------
+# local : rsync straight from the checkouts in SRC_ROOT (fast, good for a
+#         single box where you also edit the code)
+# git   : clone/fetch from GitHub into APP_ROOT/checkout/<instance> and build
+#         the ref named by GIT_REF_PROD / GIT_REF_STAGING. This is what lets
+#         staging run a newer commit than prod.
+SOURCE_MODE=local
+
+SRC_ROOT=/home/kukaass/Documents/Geoplan/eagle-cement
+
+GIT_REF_PROD=main
+GIT_REF_STAGING=main
+
+GIT_URL_SERVER=git@github.com:Geoplan-Philippines/rfid-based-authorization-server.git
+GIT_URL_CLIENT=git@github.com:Geoplan-Philippines/rfid-based-authorization-client.git
+GIT_URL_BRIDGE=git@github.com:Geoplan-Philippines/rfid-bridge.git
+
+# --- where it gets installed ------------------------------------------------
+APP_ROOT=/opt/eagle-cement
+SVC_USER=eagle
+
+# --- ports ------------------------------------------------------------------
+# API_PORT   NestJS listener (binds 0.0.0.0 so the LAN can reach it)
+# WEB_PORT   nginx vhost that serves the Angular bundle and proxies /api + /uploads
+# BRIDGE_PORT  The one TCP port the RFID reader dials in to ("Destination Port"
+#              on the reader), open on the LAN. Not per-instance: there is a
+#              single physical reader configured with one IP:port, so this
+#              belongs to the hardware. The only thing that differs between
+#              prod and staging is the backend.url the bridge posts to.
+#
+#              Two processes cannot hold one TCP port, so exactly one bridge
+#              runs at a time. Hand the reader over with:
+#                  sudo eaglectl bridge-switch staging
+API_PORT_PROD=8000
+WEB_PORT_PROD=4200
+
+API_PORT_STAGING=8001
+WEB_PORT_STAGING=4201
+
+BRIDGE_PORT=20059
+
+# --- database ---------------------------------------------------------------
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_USER=eagle
+DB_NAME_PROD=eagle_cement_prod
+DB_NAME_STAGING=eagle_cement_staging
+# Leave DB_PASSWORD empty and the script generates one on first `init`, storing
+# it in APP_ROOT/.db-password (mode 600). Set it here to use your own.
+DB_PASSWORD=
+
+# --- client build -----------------------------------------------------------
+# Relative URLs by default: the browser talks to nginx on WEB_PORT and nginx
+# proxies to the API, so the bundle works from any hostname or LAN IP and there
+# is no CORS involved. Only set these to absolute URLs if you deliberately want
+# the browser to hit the API host directly.
+API_BASE_URL=/api/v1
+FILE_BASE_URL=
+
+# --- server .env values -----------------------------------------------------
+# JWT_SECRET is generated per instance on `init` if left empty (32+ chars).
+JWT_SECRET_PROD=
+JWT_SECRET_STAGING=
+
+# Resend (transactional email). The server refuses to boot if these are empty,
+# so placeholders are written when you leave them blank — mail will just fail
+# at send time until you put real values here and re-run `init`.
+RESEND_API_KEY=null
+RESEND_FROM_EMAIL="System <onboarding@resend.dev>"
+RESEND_VERIFY_TEMPLATE_ID=
+RESEND_EAGLE_CEMENT_TEMPLATE_ID=eagle-cement
+TRANSACTION_ALERT_RECIPIENTS=operations@geosense.biz
+
+# OCR.space key used by the plate-reading flow. Placeholder until you have one.
+OCR_SPACE_API_KEY=null
+
+# --- rfid bridge ------------------------------------------------------------
+# Frame format the reader speaks: AUTO_DETECT | AUTO_VAR | AUTO_FIXED12 | PROTOCOL_E0
+BRIDGE_FRAME_FORMAT=AUTO_DETECT
+# Quiet time (ms) with no reads before a tag's presence-session closes. One
+# session = one POST = one backend transaction.
+BRIDGE_SESSION_GAP_MS=120000
+# Force-close a session this long after it opened. 0 = disabled.
+BRIDGE_SESSION_MAX_MS=0
+# Log every raw byte chunk. Useful while commissioning, noisy afterwards.
+BRIDGE_LOG_RAW_PROD=false
+BRIDGE_LOG_RAW_STAGING=true
+
+# The bridge dashboard binds to loopback only and its control API is
+# unauthenticated, so it is NOT exposed to the LAN by default. Reach it with:
+#   ssh -L 20080:localhost:20080 you@<server-ip>
+# Set to yes to publish it through nginx on BRIDGE_UI_PORT_* instead. Do this
+# only on a trusted VLAN — anyone who can reach it can stop the bridge.
+BRIDGE_UI_EXPOSE=no
+BRIDGE_UI_PORT_PROD=20090
+BRIDGE_UI_PORT_STAGING=20091
+
+# --- firewall ---------------------------------------------------------------
+# CIDR allowed to reach the LAN-facing ports when `firewall` runs. Left empty,
+# the script derives it from the subnet this box sits on. Set it to pin the
+# exact VLAN the readers and workstations live on.
+LAN_CIDR=
