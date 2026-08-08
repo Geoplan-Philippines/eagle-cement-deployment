@@ -28,6 +28,8 @@ GIT_REF_STAGING=main
 GIT_URL_SERVER=git@github.com:Geoplan-Philippines/rfid-based-authorization-server.git
 GIT_URL_CLIENT=git@github.com:Geoplan-Philippines/rfid-based-authorization-client.git
 GIT_URL_BRIDGE=git@github.com:Geoplan-Philippines/rfid-bridge.git
+GIT_URL_CAMERA=git@github.com:Geoplan-Philippines/camera-access.git
+GIT_URL_ANPR=git@github.com:Geoplan-Philippines/anpr-service.git
 
 # --- where it gets installed ------------------------------------------------
 APP_ROOT=/opt/eagle-cement
@@ -108,6 +110,80 @@ BRIDGE_LOG_RAW_STAGING=true
 BRIDGE_UI_EXPOSE=no
 BRIDGE_UI_PORT_PROD=20090
 BRIDGE_UI_PORT_STAGING=20091
+
+# --- camera stack (go2rtc + ANPR) -------------------------------------------
+# Shared by both instances, exactly like BRIDGE_PORT and for the same reason:
+# there is one set of gate cameras on one set of ports. It runs as a docker
+# compose project ('eagle-cement-camera') deployed once per host, and both APIs
+# point at it over loopback.
+#
+#   sudo eaglectl deploy all camera    rebuild and restart just the cameras
+#   sudo eaglectl camera streams       which streams are actually producing frames
+#   sudo eaglectl logs camera -f       follow both containers
+#
+# Set to no on a host with no cameras wired up yet: bootstrap then skips Docker,
+# nothing camera-related is deployed, and both APIs get
+# ANPR_CONTINUOUS_ENABLED=false so their plate workers stay quiet.
+CAMERA_ENABLED=yes
+
+# RTSP sources, one per view. Channel 101 is the HD main stream on Hikvision;
+# 102 is the lower-resolution substream. These carry the camera password, so the
+# generated .env is mode 600.
+CCTV_DOME_URL="rtsp://admin:password@192.168.100.134:554/Streaming/Channels/101"
+CCTV_FACE_URL="rtsp://admin:password@192.168.100.134:554/Streaming/Channels/101"
+CCTV_PLATE_URL="rtsp://admin:password@192.168.100.134:554/Streaming/Channels/101"
+
+# All four camera ports are published on 0.0.0.0, so any machine on the plant
+# LAN can reach them: go2rtc's dashboard on GO2RTC_API_PORT, its republished
+# RTSP on GO2RTC_RTSP_PORT (open a stream in VLC with
+# rtsp://<server-ip>:8554/gate_plate), the ANPR service's /docs on ANPR_PORT,
+# and the WebRTC media the browser connects to directly.
+#
+# WARNING: go2rtc's control API is unauthenticated. Anyone who can reach
+# GO2RTC_API_PORT can add, remove or repoint a stream. The `firewall` command
+# scopes all of these to LAN_CIDR — that is the only thing limiting them, so
+# keep LAN_CIDR as tight as the site allows and actually run `sudo ufw enable`.
+GO2RTC_API_PORT=1984
+GO2RTC_RTSP_PORT=8554
+GO2RTC_WEBRTC_PORT=8555
+
+# The address go2rtc hands the browser as its WebRTC candidate. Empty derives
+# this box's LAN address, which is what a workstation needs. Set it only if the
+# browsers reach this box through a different address (NAT, second interface).
+GO2RTC_WEBRTC_ADDR=
+
+# --- ANPR service -----------------------------------------------------------
+# Reachable at http://<server-ip>:9137/docs from anywhere on the LAN. The APIs
+# on this box use the loopback path to it regardless.
+ANPR_PORT=9137
+# fast-alpr model names; both are downloaded on first run and cached in the
+# anpr-model-cache docker volume. Larger detectors (yolo-v9-s-608-...) read
+# smaller/blurrier plates at a real CPU cost.
+ANPR_DETECTOR_MODEL=yolo-v9-t-384-license-plate-end2end
+ANPR_OCR_MODEL=cct-xs-v2-global-model
+# Detections below this confidence are discarded.
+ANPR_CONFIDENCE_THRESHOLD=0.4
+# cpu, or cuda with a GPU box and fast-alpr[onnx-gpu] in requirements.txt.
+ANPR_DEVICE=cpu
+ANPR_CROP_PADDING=0
+# Keep the full frame next to each plate crop (two images per detection).
+ANPR_SAVE_WIDE_IMAGE=true
+ANPR_LOG_LEVEL=INFO
+
+# The ANPR service pushing detections to the API itself. Off by default: today
+# the API pulls them through /cctv/anpr/detect. ANPR_UPLOAD_INSTANCE decides
+# which API it would post to.
+ANPR_UPLOAD_ENABLED=false
+ANPR_UPLOAD_INSTANCE=prod
+
+# The API-side worker that polls the plate stream continuously, independent of
+# whether anyone has the /cctv/plate page open. One camera means one recorder,
+# so this is the camera's equivalent of 'bridge-switch': leave staging off
+# unless you deliberately want it reading the gate instead of prod.
+ANPR_CONTINUOUS_PROD=true
+ANPR_CONTINUOUS_STAGING=false
+ANPR_STREAM_ID=gate_plate
+ANPR_POLL_INTERVAL_MS=1500
 
 # --- firewall ---------------------------------------------------------------
 # CIDR allowed to reach the LAN-facing ports when `firewall` runs. Left empty,

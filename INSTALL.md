@@ -5,6 +5,9 @@ independent instances**, production and staging. Each instance is a full
 vertical slice: its own database, its own API process, its own compiled Angular
 bundle, and its own RFID bridge.
 
+Two things are **shared** rather than duplicated, because the hardware behind
+them is: the RFID reader port, and the gate cameras.
+
 ```
                     ┌──────────────── PLANT LAN ────────────────┐
                     │                                            │
@@ -14,6 +17,11 @@ bundle, and its own RFID bridge.
                     │                                    │   │   │
    Workstation ─────┼──► :4200 nginx ──► API :8000 ◄─────┘   │   │
    Workstation ─────┼──► :4201 nginx ──► API :8001 ◄─────────┘   │
+                    │       │             │  │                   │
+                    │       │  webrtc     │  │                   │
+                    │       └── :8555 ────┼──┴─► go2rtc ──► ANPR │
+                    │                     │      (shared camera  │
+   Gate cameras ────┼──► rtsp/554 ────────┼───    stack, §6.5)   │
                     │                     │                      │
                     └─────────────────────┼──────────────────────┘
                                           ▼
@@ -22,7 +30,9 @@ bundle, and its own RFID bridge.
 ```
 
 Everything except the bridge dashboard binds `0.0.0.0`, because the readers and
-the office workstations reach this box over the plant network.
+the office workstations reach this box over the plant network. That includes the
+camera stack, whose go2rtc API is unauthenticated — the `ufw` rules from
+`eaglectl firewall` are what confine it to your LAN (§6.5).
 
 | | production | staging |
 |---|---|---|
@@ -33,6 +43,7 @@ the office workstations reach this box over the plant network.
 | API service | `eagle-api@prod` | `eagle-api@staging` |
 | Bridge service | `eagle-bridge@prod` | `eagle-bridge@staging` |
 | Install root | `/opt/eagle-cement/prod` | `/opt/eagle-cement/staging` |
+| Camera stack | `eagle-cement-camera` — one shared compose project (§6.5) | |
 
 ---
 
@@ -41,22 +52,28 @@ the office workstations reach this box over the plant network.
 ### 1.1 Host
 
 - Ubuntu 22.04 or 24.04 (Debian 12 also works), x86-64
-- 4 GB RAM minimum, 8 GB comfortable — two Node builds and an Angular build
-- ~10 GB free disk: each instance carries its own `node_modules` and build output
+- 6 GB RAM minimum, 8 GB comfortable — two Node builds, an Angular build, and
+  the ANPR container holding two ONNX models in memory
+- ~16 GB free disk: each instance carries its own `node_modules` and build
+  output, and the camera stack adds ~3 GB of container images plus whatever the
+  plate snapshots accumulate to
 - A static LAN address, or a DHCP reservation. The readers are configured with
-  this box's IP, so it must not move.
-- Outbound internet on first run only, to fetch apt packages, Node and bun.
+  this box's IP, so it must not move — and go2rtc hands that same address to
+  browsers as its WebRTC candidate.
+- Outbound internet on first run only, to fetch apt packages, Node, bun,
+  container images and the ANPR models.
 - `sudo` / root access, and `git` available to clone the repositories.
 
-Everything else — PostgreSQL, nginx, Node.js 22, bun, JDK 17 — is installed by
-`bootstrap`.
+Everything else — PostgreSQL, nginx, Node.js 22, bun, JDK 17, Docker Engine with
+the compose v2 plugin — is installed by `bootstrap`. Docker is skipped entirely
+when `CAMERA_ENABLED=no`.
 
 ### 1.2 Ports must be free
 
 `bootstrap` will not move an existing service out of the way. Check first:
 
 ```bash
-sudo ss -lptn 'sport = :4200 or sport = :4201 or sport = :8000 or sport = :8001 or sport = :20059'
+sudo ss -lptn 'sport = :4200 or sport = :4201 or sport = :8000 or sport = :8001 or sport = :20059 or sport = :1984 or sport = :8554 or sport = :8555 or sport = :9137'
 ```
 
 | Port | Used by | If taken |
@@ -65,6 +82,14 @@ sudo ss -lptn 'sport = :4200 or sport = :4201 or sport = :8000 or sport = :8001 
 | `8000`, `8001` | NestJS APIs | change `API_PORT_*` |
 | `20059` | bridge reader listener (one port, both instances) | change `BRIDGE_PORT`, **and reconfigure the readers** |
 | `5432` | PostgreSQL | reuse it — point `DB_HOST`/`DB_PORT` at the existing server |
+| `1984` | go2rtc API and dashboard | change `GO2RTC_API_PORT` |
+| `8554` | go2rtc RTSP republisher | change `GO2RTC_RTSP_PORT` |
+| `8555` | go2rtc WebRTC, tcp **and** udp | change `GO2RTC_WEBRTC_PORT` |
+| `9137` | ANPR service (`/docs`, `/detect`, `/health`) | change `ANPR_PORT` |
+
+The camera ports only matter when `CAMERA_ENABLED=yes` (the default). All four
+are published on `0.0.0.0`, so they are reachable from any machine on the plant
+LAN — see §6.5 for what that means for go2rtc's unauthenticated API.
 
 Nothing here needs port 80. If another web server (Apache, for instance) already
 owns it, leave it running — `bootstrap` disables nginx's stock `default` site,
@@ -81,7 +106,7 @@ belongs to something else:
 sudo -u postgres psql -c '\du eagle' -c '\l eagle_cement_*'
 ```
 
-### 1.4 Access to the four repositories
+### 1.4 Access to the five repositories
 
 The clone URLs are SSH (`git@github.com:Geoplan-Philippines/…`), so the account
 running the clone needs a key on the GitHub org. Confirm with:
@@ -118,6 +143,14 @@ Optional — sensible defaults, set them when you want the feature:
 | `TRANSACTION_ALERT_RECIPIENTS` | empty | auto-alerting on non-`VERIFIED` transactions is disabled |
 | `RESEND_VERIFY_TEMPLATE_ID` | unset | verification email has no template |
 | `LAN_CIDR` | derived from this box's subnet | may pick the wrong interface on a multi-homed host |
+| `CCTV_DOME_URL`, `CCTV_FACE_URL`, `CCTV_PLATE_URL` | empty | go2rtc starts, but those streams have no source — the live views and the plate worker stay blank |
+| `GO2RTC_WEBRTC_ADDR` | this box's LAN address | only set it when browsers reach this box through a different address |
+
+The three `CCTV_*_URL` values are the camera RTSP URLs, password included, in
+the form `rtsp://user:pass@host:554/Streaming/Channels/101` for Hikvision
+(`101` is the HD main stream, `102` the substream). Have them before `init` if
+the cameras are already on the network; the generated `.env` holding them is
+mode 600. Nothing else about the camera stack needs credentials.
 
 `DATABASE_URL` and `JWT_SECRET` are also required, but the script generates
 both — you do not supply them.
@@ -132,7 +165,7 @@ ls rfid-based-authorization-server/docs/*.csv
 
 ## 2. Get the code onto the server
 
-The four repositories must sit side by side, with `deploy/` alongside them:
+The five repositories must sit side by side, with `deploy/` alongside them:
 
 ```
 eagle-cement/
@@ -140,7 +173,8 @@ eagle-cement/
 ├── rfid-based-authorization-server/     ← NestJS API + Prisma
 ├── rfid-based-authorization-client/     ← Angular UI
 ├── rfid-bridge/                         ← Java bridge (reader → API)
-└── anpr-service/                        ← not deployed by this script (see §10)
+├── camera-access/                       ← go2rtc config for the gate cameras
+└── anpr-service/                        ← plate detection + OCR (FastAPI)
 ```
 
 ```bash
@@ -148,8 +182,16 @@ mkdir -p ~/eagle-cement && cd ~/eagle-cement
 git clone git@github.com:Geoplan-Philippines/rfid-based-authorization-server.git
 git clone git@github.com:Geoplan-Philippines/rfid-based-authorization-client.git
 git clone git@github.com:Geoplan-Philippines/rfid-bridge.git
+git clone git@github.com:Geoplan-Philippines/camera-access.git
+git clone git@github.com:Geoplan-Philippines/anpr-service.git
 # plus the deploy/ directory containing eagle-cement.sh
 ```
+
+The `docker-compose.yml` in the repository root is a **development** convenience
+for running the camera stack from a working copy. The deployment generates its
+own compose file at `/opt/eagle-cement/camera/docker-compose.yml` — with the
+right ports, the loopback bindings and the real paths — so the root file is
+neither read nor copied by `eaglectl`.
 
 ## 3. Configure
 
@@ -168,11 +210,13 @@ sudo nano /etc/eagle-cement/deploy.conf
 
 At minimum, set:
 
-- `SRC_ROOT` — the directory holding the four repos
+- `SRC_ROOT` — the directory holding the five repos
 - `RESEND_API_KEY`, `RESEND_FROM_EMAIL`, `RESEND_EAGLE_CEMENT_TEMPLATE_ID`,
   `OCR_SPACE_API_KEY` — all four are required; the API refuses to boot without
   them (see §1.5)
 - `LAN_CIDR` — pin the reader VLAN instead of letting it be derived
+- `CCTV_DOME_URL`, `CCTV_FACE_URL`, `CCTV_PLATE_URL` — the camera RTSP URLs, or
+  `CAMERA_ENABLED=no` if the cameras are not in yet
 
 To have staging track a different branch than production, set
 `SOURCE_MODE=git` and `GIT_REF_STAGING=develop`. In `local` mode both instances
@@ -183,17 +227,22 @@ means staging and production always run the same code.
 
 ```bash
 cd deploy                            # if you are not already there
-sudo ./eagle-cement.sh bootstrap     # packages, service user, systemd units
-sudo ./eagle-cement.sh init all      # databases, .env, bridge.properties, nginx
+sudo ./eagle-cement.sh bootstrap     # packages, Docker, service user, systemd units
+sudo ./eagle-cement.sh init all      # databases, .env, bridge.properties, nginx, camera config
 sudo ./eagle-cement.sh deploy all    # sync, build, migrate, start everything
 ```
 
 `bootstrap` also links the script to `/usr/local/bin/eaglectl`, so afterwards you
 can just run `sudo eaglectl <command>` from anywhere.
 
-The first `deploy` takes 5–15 minutes: it installs dependencies and builds two
-NestJS apps, two Angular bundles and the bridge jar. Later deploys are much
-faster because `node_modules` is kept.
+The first `deploy` takes 15–30 minutes: it installs dependencies and builds two
+NestJS apps, two Angular bundles, the bridge jar and the ANPR container image
+(which pulls PyTorch and onnxruntime), then downloads the ANPR models on first
+container start. Later deploys are much faster — `node_modules`, the docker
+layer cache and the `anpr-model-cache` volume all survive.
+
+`deploy all` does the shared camera stack first and once, then loops over the
+instances. To rebuild only the cameras, `sudo eaglectl deploy all camera`.
 
 Then load the initial data and mint the bridge credentials:
 
@@ -226,6 +275,9 @@ sudo ufw enable      # only if you actually want the firewall on
 ```
 prod     web http://10.10.0.137:4200/   api http://10.10.0.137:8000/api/v1   reader 10.10.0.137:20059
 staging  web http://10.10.0.137:4201/   api http://10.10.0.137:8001/api/v1   reader 10.10.0.137:20059
+camera   go2rtc http://10.10.0.137:1984/    anpr http://10.10.0.137:9137/docs
+         webrtc 10.10.0.137:8555 (tcp+udp)   rtsp rtsp://10.10.0.137:8554/<stream>
+         go2rtc's API is unauthenticated — keep it inside LAN_CIDR.
 
 Both instances share reader port 20059, so only one bridge runs at a time
 — currently prod. Switch with: sudo eagle-cement.sh bridge-switch <instance>
@@ -256,19 +308,53 @@ sudo eaglectl logs prod bridge -f
 With `log.raw=true` you will see every byte chunk arrive. Production defaults to
 `log.raw=false`; staging leaves it on for commissioning.
 
+### The cameras
+
+The cameras are not configured to point at this box — it dials them. Each
+`CCTV_*_URL` in the conf is an RTSP URL the box opens as a client, so on the
+camera side you only need:
+
+- a static address (or DHCP reservation) matching the URL
+- an account whose password is what the URL carries
+- the main stream on channel `101`, the substream on `102` (Hikvision)
+
+After `init` and `deploy all camera`, confirm each stream is actually producing
+frames — a stream that is merely *configured* looks identical in `status`:
+
+```bash
+sudo eaglectl camera streams
+```
+
+```
+go2rtc streams on 127.0.0.1:1984
+  ✓ stream 'gate_dome' is producing frames
+  ✓ stream 'gate_face' is producing frames
+  ✓ stream 'gate_plate' is producing frames
+
+  WebRTC candidate handed to browsers: 10.10.0.137:8555
+```
+
+If the candidate address is wrong for the workstations, set
+`GO2RTC_WEBRTC_ADDR` and re-run `init`. A wrong candidate is the classic
+"everything is green but the video never starts" fault: the browser negotiates
+successfully and then sends media to an address it cannot reach.
+
 ## 6. Day-to-day operation
 
 ```bash
 sudo eaglectl status                 # what is running, and where
-sudo eaglectl health                 # probe API, web, database and reader port
+sudo eaglectl health                 # probe API, web, database, reader port, cameras
 sudo eaglectl urls                   # LAN addresses for hardware and browsers
 
 sudo eaglectl logs prod server -f    # API log
 sudo eaglectl logs prod bridge -f    # bridge log
 sudo eaglectl logs prod nginx        # nginx error log
+sudo eaglectl logs camera -f         # both camera containers
+sudo eaglectl logs camera anpr-service -f   # just the plate detector
 
 sudo eaglectl restart staging        # everything in one instance
 sudo eaglectl restart prod server    # just the API
+sudo eaglectl restart all camera     # the shared camera stack
 ```
 
 ### Shipping a change
@@ -423,6 +509,83 @@ expose it on the LAN, set `BRIDGE_UI_EXPOSE=yes` plus the `BRIDGE_UI_PORT_*`
 values and redeploy the bridge. Only do this on a trusted VLAN: anyone who can
 reach that port can stop the bridge.
 
+### 6.5 The shared camera stack
+
+The cameras are shared for the same reason the reader port is: there is one set
+of them. `go2rtc` and the ANPR service run as a single docker compose project,
+`eagle-cement-camera`, deployed once per host — not once per instance — and both
+APIs reach it over loopback.
+
+```bash
+sudo eaglectl deploy all camera      # sync, rebuild the image, restart
+sudo eaglectl camera ps              # docker compose ps
+sudo eaglectl camera streams         # which streams are producing frames
+sudo eaglectl logs camera -f
+sudo eaglectl restart all camera
+```
+
+**All four camera ports are on the LAN.** From any workstation on the plant
+network:
+
+| URL | What |
+|---|---|
+| `http://<server-ip>:1984/` | go2rtc's own dashboard — stream list, live preview, logs |
+| `http://<server-ip>:9137/docs` | the ANPR service's OpenAPI page; `POST /detect` a JPEG and get the plate back |
+| `rtsp://<server-ip>:8554/gate_plate` | open the republished stream in VLC |
+| `<server-ip>:8555` tcp+udp | WebRTC media — the browser connects here directly |
+
+The two APIs on this box still reach the stack over `127.0.0.1` (`GO2RTC_API_URL`
+and `ANPR_SERVICE_URL` in each generated `.env`) — same listener, shortest path.
+
+**go2rtc's API has no authentication.** Anyone who can reach `:1984` can add,
+remove or repoint a stream, and the camera RTSP URLs — passwords included — are
+visible there. The `ufw` rules are the only thing limiting that, so this matters:
+
+```bash
+sudo eaglectl firewall     # allows LAN_CIDR → 1984, 8554, 8555 (tcp+udp), 9137
+sudo ufw enable            # the rules do nothing until the firewall is on
+sudo ufw status numbered
+```
+
+Set `LAN_CIDR` to the narrowest subnet that still contains the workstations that
+need it, rather than letting it be derived. To take these off the LAN later,
+change the `ports:` lines in `write_compose_file` back to `127.0.0.1:<port>:…`
+and re-run `init` — nothing in the APIs depends on them being externally
+reachable.
+
+**Only one instance should be recording.** Both APIs can *view* the cameras, but
+the continuous plate worker — the one that reads the gate whether or not anyone
+has the page open — is the camera's equivalent of `bridge-switch`. It is on for
+production and off for staging:
+
+```
+ANPR_CONTINUOUS_PROD=true
+ANPR_CONTINUOUS_STAGING=false
+```
+
+`status` shows which instance is recording:
+
+```
+prod
+  anpr     recording (worker)   stream 'gate_plate' every 1500ms
+staging
+  anpr     off       (worker)   stream 'gate_plate' every 1500ms
+
+camera (shared)
+  go2rtc   running  (docker)   http://10.10.0.137:1984/  webrtc 10.10.0.137:8555
+  anpr     running  (docker)   http://10.10.0.137:9137/docs
+```
+
+To hand recording to staging, flip both values and re-run
+`init` — it rewrites each instance's `.env` — then restart the APIs. Unlike
+`bridge-switch` nothing enforces exclusivity here, because nothing physically
+prevents both from polling; leaving both on means the same truck is recorded
+twice, in two databases.
+
+Deploying the camera stack is independent of the instances: it never restarts an
+API, and `destroy <instance>` leaves it running. It is removed only by
+`purge-host` or the uninstaller.
+
 ## 7. What gets created on the server
 
 ```
@@ -442,7 +605,16 @@ reach that port can stop the bridge.
 │   │   └── RfidBridge/logs/      bridge.log
 │   ├── uploads/                  truck/driver photos and plate crops
 │   └── backups/                  pg_dump output
-└── staging/                      identical layout
+├── staging/                      identical layout
+└── camera/                       shared — not per instance
+    ├── docker-compose.yml        generated compose project
+    ├── camera-access/
+    │   ├── .env                  RTSP URLs, camera passwords (mode 600)
+    │   └── go2rtc.yaml           generated, incl. the WebRTC candidate
+    └── anpr-service/
+        ├── .env                  generated config (mode 600)
+        ├── Dockerfile, app/      synced source, the image build context
+        └── snapshots/            wide frames + plate crops, bind-mounted
 ```
 
 System-level files:
@@ -460,6 +632,12 @@ hardening (`ProtectSystem=strict`, `NoNewPrivileges`, `PrivateTmp`), writing
 only inside their own instance directory. They start on boot and restart on
 failure.
 
+The camera stack is the exception: it is containers, not systemd units, managed
+by Docker under the `eagle-cement-camera` compose project. Both containers carry
+`restart: unless-stopped`, so they come back on boot and after a crash the same
+way. Docker also owns one named volume, `eagle-cement-camera_anpr-model-cache`,
+holding the downloaded ONNX weights so a rebuild does not re-fetch them.
+
 ## 8. How the pieces talk
 
 - **Browser → nginx → API.** The Angular bundle is compiled with
@@ -474,6 +652,20 @@ failure.
   `x-api-key` minted by `eaglectl bridge-key`.
 - **API → PostgreSQL** over loopback, one database per instance, using the
   shared `eagle` role.
+- **Cameras → go2rtc → API → browser.** go2rtc dials each camera's RTSP URL and
+  republishes it. The browser asks its own API for a WHEP offer
+  (`POST /api/v1/cctv/whep`); the API relays that to go2rtc on `127.0.0.1:1984`
+  and hands the answer back. From then on media flows browser-to-go2rtc directly
+  over `:8555`. Signalling therefore goes through the authenticated API even
+  though `:1984` is also open on the LAN.
+- **API → ANPR.** For a plate reading the API pulls a JPEG frame from go2rtc
+  (`/api/frame.jpeg?src=gate_plate`) and POSTs it to the ANPR service on
+  `127.0.0.1:9137`, which returns the plate text and writes the crop and wide
+  frame under `camera/anpr-service/snapshots/`. This happens both on demand, for
+  the live preview, and on a timer in the continuous worker (§6.5). The ANPR
+  service's own push-to-backend path exists but is off (`UPLOAD_ENABLED=false`):
+  the API pulls rather than the service pushing, so there is one direction of
+  travel and no second credential to manage.
 
 ## 9. Troubleshooting
 
@@ -527,6 +719,47 @@ must leave the field for two minutes before a fresh transaction opens. Lower
 **Port already in use.** `sudo ss -ltnp | grep <port>`. Change the port in the
 config, re-run `init`, and redeploy.
 
+**A camera stream is configured but produces no frames.**
+`sudo eaglectl camera streams` marks it. Almost always the RTSP URL: wrong
+password, wrong channel, or the camera is unreachable from this box. Check the
+URL by hand before touching anything else —
+
+```bash
+sudo grep CCTV_ /opt/eagle-cement/camera/camera-access/.env
+ffprobe -rtsp_transport tcp 'rtsp://user:pass@host:554/Streaming/Channels/101'
+```
+
+then fix `CCTV_*_URL` in the conf, `sudo eaglectl init`, and
+`sudo eaglectl restart all camera`. Note that a password containing `@` or `/`
+must be percent-encoded in the URL.
+
+**The live view connects but the video never appears.** The WebRTC candidate is
+an address the browser cannot reach. `sudo eaglectl camera streams` prints the
+candidate go2rtc is handing out; it must be an address the workstation can route
+to. Set `GO2RTC_WEBRTC_ADDR`, re-run `init`, restart the camera stack. Also
+confirm `:8555` is open on **udp** as well as tcp — `sudo eaglectl firewall`
+adds both, but a hand-written rule often covers only tcp.
+
+**A camera URL works from another machine but not from the server.** Check it
+the other way round too: go2rtc's dashboard at `http://<server-ip>:1984/` shows
+each stream's live state and its error, which is usually faster than reading
+logs. If that page itself is refused from a workstation, `ufw` is blocking it —
+`sudo ufw status numbered` and confirm `LAN_CIDR` covers that machine.
+
+**The ANPR service never becomes healthy on first deploy.** It downloads its
+detector and OCR models on first start, which is slow on a plant link;
+`deploy` waits up to three minutes. `sudo eaglectl logs camera anpr-service -f`
+shows the download. Once cached in the `anpr-model-cache` volume, later starts
+take seconds.
+
+**The same truck is recorded twice.** Both instances have the continuous plate
+worker enabled. One camera, one recorder — see §6.5.
+
+**`deploy … camera` fails with a docker permission or socket error.** The
+compose project runs as root from the script, so this normally means the daemon
+is not up: `systemctl status docker`. If Docker was installed by hand without
+the compose v2 plugin, `docker compose version` fails and `bootstrap` says so.
+
 **Start over on one instance.** `sudo eaglectl destroy staging` removes its
 services, files and database — production is untouched. Then `init` and `deploy`
 it again. See §12 for the full range of removal options.
@@ -539,12 +772,26 @@ it again. See §12 for the full range of removal options.
   credential. Re-enable the guard before this box is reachable from an untrusted
   network — `bridge-key` will then need a token, or you paste a key into
   `bridge.properties` by hand.
-- **The `anpr-service` (Python plate detection) is not deployed here.** It has
-  its own Dockerfile and, per its `.env.example`, wants a NestJS upload URL.
-  Wire it up separately once its integration is settled.
-- **No TLS.** Traffic is plain HTTP on the plant LAN. If the UI ever needs to be
-  reachable beyond that network, put a certificate on the nginx vhosts and
-  change `WEB_PORT` to 443.
+- **The camera stack is shared but not interlocked.** `bridge-switch` enforces
+  that exactly one bridge holds the reader. Nothing equivalent exists for the
+  continuous plate worker: setting `ANPR_CONTINUOUS_*` on for both instances
+  will happily record the same truck into both databases (§6.5).
+- **go2rtc's API has `origin: "*"`, no authentication, and is on the LAN.**
+  Anyone who can reach `:1984` can list the streams — camera passwords included,
+  they are in the RTSP URLs — and add, remove or repoint one. The ANPR service
+  on `:9137` is likewise unauthenticated. `ufw` scoped to `LAN_CIDR` is the only
+  control on this, so run `eaglectl firewall` **and** `ufw enable`, and treat
+  the plant VLAN as trusted or narrow `LAN_CIDR` until it is.
+- **The camera passwords sit in two places.** `/etc/eagle-cement/deploy.conf`
+  and the generated `/opt/eagle-cement/camera/camera-access/.env`, both mode
+  600. Rotating a camera password means editing the conf and re-running `init`.
+- **The ANPR service holds its models in one process.** A single container with
+  one worker, so plate requests serialise. That is ample for one gate; a second
+  lane needs a second replica and a way to route to it.
+- **No TLS.** Traffic is plain HTTP on the plant LAN — including the WebRTC
+  signalling, though the media itself is DTLS-encrypted by WebRTC regardless. If
+  the UI ever needs to be reachable beyond that network, put a certificate on
+  the nginx vhosts and change `WEB_PORT` to 443.
 - **Backups are local.** Dumps land on the same disk as the database. Copy them
   off the box on a schedule.
 - **`CORS_ALLOWED_ORIGINS` records the LAN IP at `init` time.** If the server's
@@ -557,19 +804,21 @@ it again. See §12 for the full range of removal options.
 sudo eaglectl <command> [instance] [component]
 
   instance    prod | staging | all           (default: all)
-  component   server | client | bridge | all (default: all)
+  component   server | client | bridge | camera | all (default: all)
+              'camera' is host-level and shared — deployed once, not per instance
 
 setup
-  bootstrap                   install packages, service user and systemd units
-  init [instance]             create the database, write .env / bridge.properties / nginx
+  bootstrap                   install packages, Docker, service user and systemd units
+  init [instance]             create the database, write .env / bridge.properties / nginx / camera config
   deploy [instance] [comp]    sync source, build, migrate, restart
   firewall                    open the LAN ports in ufw
 
 day to day
   status [instance]           what is running, and where
-  health [instance]           probe API, web, database and reader port
+  health [instance]           probe API, web, database, reader port and cameras
   urls [instance]             LAN URLs and the port each reader should dial
   logs <instance> <server|bridge|nginx> [-f]
+  logs camera [go2rtc|anpr-service] [-f]
   start | stop | restart [instance] [comp]
 
 database
@@ -584,9 +833,15 @@ rfid bridge
   bridge-ui [instance]        dashboard URL and SSH tunnel command
   bridge-switch <instance>    hand the shared reader port to that instance
 
+cameras
+  camera streams              which go2rtc streams are producing frames
+  camera ps                   docker compose ps for the camera stack
+
 teardown
   destroy <prod|staging|all>  remove instances: services, files, uploads, database
-  purge-host                  after 'destroy all': systemd units, eagle user/role, /opt
+                              (the shared camera stack is left running)
+  purge-host                  after 'destroy all': systemd units, camera stack,
+                              eagle user/role, /opt
 
 ./eagle-cement-uninstall.sh [--dry-run] [--yes] [--purge-config]
                             remove the entire stack in one command (§12.0)
@@ -602,7 +857,9 @@ sudo ./eagle-cement-uninstall.sh
 
 Removes the whole stack — both instances' services, files, uploads, local
 backups and databases, plus the systemd units, the `eagle` user and PostgreSQL
-role, the nginx vhosts, the ufw rules and `/usr/local/bin/eaglectl`.
+role, the nginx vhosts, the ufw rules and `/usr/local/bin/eaglectl`. The shared
+camera stack goes too: both containers, the `eagle-cement-anpr` image, the model
+cache volume and every saved plate snapshot.
 
 It surveys the box first and prints what it found, then asks you to type
 `DELETE`. See exactly what it would do, changing nothing:
@@ -623,8 +880,8 @@ idempotent and non-fatal: a step that cannot complete is reported at the end
 rather than aborting the run and leaving the box half-removed. Re-running is
 safe, and is the way to retry.
 
-It does **not** remove PostgreSQL, nginx, Node.js, bun or the JDK — those are
-shared system packages. §12.4 covers those.
+It does **not** remove PostgreSQL, nginx, Node.js, bun, the JDK or Docker itself
+— those are shared system packages. §12.4 covers those.
 
 ### 12.0.1 Removing less than everything
 
@@ -665,7 +922,8 @@ Stops and disables `eagle-api@staging` and `eagle-bridge@staging`, removes the
 nginx vhosts (and the bridge UI vhost, if enabled), drops
 `eagle_cement_staging`, and deletes `/opt/eagle-cement/staging` — uploads and
 local backups included. Production keeps running throughout; nginx is reloaded,
-not restarted.
+not restarted. The shared camera stack is untouched and keeps running, since
+production is still using it.
 
 To bring it back:
 
@@ -690,6 +948,7 @@ for a fresh `init` + `deploy`. Still present afterwards:
 - the systemd template units
 - the `eagle` service user and the `eagle` PostgreSQL role
 - `/opt/eagle-cement/` — notably `.db-password` and the build caches in `.home/`
+- the camera stack, still running: it is host-level, and `destroy` is per-instance
 - `/usr/local/bin/eaglectl`, `/etc/eagle-cement/deploy.conf`, and the ufw rules
 
 ### 12.4 Remove the host-level install too
@@ -699,14 +958,19 @@ sudo eaglectl purge-host
 ```
 
 Only runs once no instance directory is left, so `destroy all` must come first.
-It removes the two systemd template units, drops the `eagle` PostgreSQL role,
-deletes the ufw rules it added, removes `/opt/eagle-cement` and the `eaglectl`
-symlink, and deletes the `eagle` system user.
+It removes the two systemd template units, tears down the camera stack
+(containers, the `eagle-cement-anpr` image and the model-cache volume), drops
+the `eagle` PostgreSQL role, deletes the ufw rules it added, removes
+`/opt/eagle-cement` and the `eaglectl` symlink, and deletes the `eagle` system
+user.
+
+This is the point where the camera stack goes — it survives `destroy all`,
+because it is host-level, not part of either instance.
 
 It leaves alone, on purpose:
 
-- **PostgreSQL, nginx, Node.js, bun and the JDK.** Shared system packages —
-  something else on this box may depend on them.
+- **PostgreSQL, nginx, Node.js, bun, the JDK and Docker.** Shared system
+  packages — something else on this box may depend on them.
 - **`/etc/eagle-cement/deploy.conf`.** Holds your API keys; keep it if you plan
   to reinstall, and shred it if you do not.
 - **The nginx `default` site**, which `bootstrap` disabled. Re-enable it with
@@ -723,7 +987,17 @@ sudo apt-get purge -y nginx nginx-common postgresql postgresql-contrib \
 sudo apt-get autoremove -y
 sudo rm -rf /opt/bun /usr/local/bin/bun /usr/local/bin/bunx
 sudo rm -f /etc/apt/sources.list.d/nodesource.list
+
+# Docker, if this box was only ever running the camera stack
+sudo apt-get purge -y docker-ce docker-ce-cli containerd.io \
+                      docker-buildx-plugin docker-compose-plugin
+sudo rm -rf /var/lib/docker
+sudo rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.asc
 ```
+
+Removing `/var/lib/docker` destroys **every** container, image and volume on
+this host. Check what else is there first: `sudo docker ps -a && sudo docker
+volume ls`.
 
 Purging `postgresql` destroys **every** database on this host, not just the
 Eagle Cement ones. Check what else lives there first:
@@ -739,5 +1013,7 @@ systemctl list-units 'eagle-*' --all      # expect: no units
 ls /opt/eagle-cement 2>&1                 # expect: No such file or directory
 sudo -u postgres psql -c '\l' | grep eagle # expect: no rows
 ls /etc/nginx/sites-enabled/               # expect: no eagle-* entries
-sudo ss -lptn | grep -E ':(4200|4201|8000|8001|20059)'         # expect: nothing
+sudo docker ps -a | grep eagle-cement      # expect: no containers
+sudo docker volume ls | grep eagle-cement  # expect: no volumes
+sudo ss -lptn | grep -E ':(4200|4201|8000|8001|20059|1984|8554|8555|9137)'  # expect: nothing
 ```

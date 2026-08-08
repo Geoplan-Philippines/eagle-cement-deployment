@@ -15,8 +15,13 @@
 #   · /opt/eagle-cement — application files, uploads, local backups, build caches
 #   · the ufw rules it opened, and /usr/local/bin/eaglectl
 #
+# and, for the shared camera stack:
+#   · the eagle-cement-camera compose project: the go2rtc and ANPR containers,
+#     the eagle-cement-anpr image, the ONNX model cache volume and every saved
+#     plate snapshot
+#
 # It leaves alone, on purpose:
-#   · PostgreSQL, nginx, Node.js, bun and the JDK — shared system packages
+#   · PostgreSQL, nginx, Node.js, bun, the JDK and Docker — shared system packages
 #   · /etc/eagle-cement/deploy.conf — holds your API keys; use --purge-config
 #   · your source repositories
 #
@@ -44,6 +49,7 @@ API_PORT_STAGING=8001
 BRIDGE_PORT=20059
 BRIDGE_UI_PORT_PROD=20090
 BRIDGE_UI_PORT_STAGING=20091
+GO2RTC_WEBRTC_PORT=8555
 LAN_CIDR=
 
 # Overridable so the removal path can be exercised against a scratch tree
@@ -59,6 +65,8 @@ for _f in "$HERE/eagle-cement.conf" /etc/eagle-cement/deploy.conf; do
 done
 
 INSTANCES=(prod staging)
+CAMERA_DIR="$APP_ROOT/camera"
+COMPOSE_PROJECT=eagle-cement-camera
 
 ASSUME_YES=0
 PURGE_CONFIG=0
@@ -155,6 +163,13 @@ else
     warn "Start it and re-run if you need them gone: systemctl start postgresql"
 fi
 
+if command -v docker >/dev/null 2>&1; then
+    for c in eagle-cement-go2rtc eagle-cement-anpr; do
+        docker inspect "$c" >/dev/null 2>&1 && note_found "container $c"
+    done
+    [[ -d $CAMERA_DIR ]] && note_found "camera stack in $CAMERA_DIR (plate snapshots included)"
+fi
+
 id "$SVC_USER" >/dev/null 2>&1 && note_found "system user $SVC_USER"
 [[ -e $SYSTEMD_DIR/eagle-api@.service ]] && note_found "systemd unit templates"
 [[ -e /usr/local/bin/eaglectl ]] && note_found "/usr/local/bin/eaglectl"
@@ -186,7 +201,7 @@ fi
 printf '\n'
 
 # ---------------------------------------------------------------------------
-# 1. services
+# 1. services and containers
 # ---------------------------------------------------------------------------
 
 log "Stopping services"
@@ -199,6 +214,31 @@ for inst in "${INSTANCES[@]}"; do
         fi
     done
 done
+
+# The camera stack. 'compose down' needs the generated compose file, which is
+# under APP_ROOT and therefore about to be deleted — so it has to happen here,
+# before section 5 removes the tree. If the file is already gone (a half-removed
+# install, which is exactly when this script gets used), fall back to removing
+# the containers by name so nothing is left running against a deleted config.
+if command -v docker >/dev/null 2>&1; then
+    log "Removing the camera stack"
+    if [[ -f $CAMERA_DIR/docker-compose.yml ]]; then
+        step "docker compose down (containers, network and model cache)"
+        run bash -c "cd '$CAMERA_DIR' && docker compose -p '$COMPOSE_PROJECT' down --volumes --remove-orphans"
+    else
+        for c in eagle-cement-go2rtc eagle-cement-anpr; do
+            if docker inspect "$c" >/dev/null 2>&1; then
+                step "removing container $c"
+                run docker rm -f "$c"
+            fi
+        done
+        run docker volume rm -f "${COMPOSE_PROJECT}_anpr-model-cache"
+    fi
+    if docker image inspect eagle-cement-anpr:latest >/dev/null 2>&1; then
+        step "removing image eagle-cement-anpr:latest"
+        run docker image rm -f eagle-cement-anpr:latest
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # 2. nginx
@@ -272,10 +312,13 @@ if command -v ufw >/dev/null 2>&1; then
     step "for $cidr"
     for port in "$WEB_PORT_PROD" "$API_PORT_PROD" "$BRIDGE_UI_PORT_PROD" \
                 "$WEB_PORT_STAGING" "$API_PORT_STAGING" "$BRIDGE_UI_PORT_STAGING" \
-                "$BRIDGE_PORT"; do
+                "$BRIDGE_PORT" "$GO2RTC_WEBRTC_PORT"; do
         run ufw --force delete allow from "$cidr" to any port "$port" proto tcp \
             >/dev/null 2>&1 || true
     done
+    # WebRTC media negotiates over either transport, so 'firewall' opened both.
+    run ufw --force delete allow from "$cidr" to any port "$GO2RTC_WEBRTC_PORT" proto udp \
+        >/dev/null 2>&1 || true
 fi
 
 # ---------------------------------------------------------------------------
@@ -345,6 +388,11 @@ check "no systemd units"        "[[ -e $SYSTEMD_DIR/eagle-api@.service ]]"
 check "no eaglectl symlink"     "[[ -e /usr/local/bin/eaglectl ]]"
 check "no nginx vhosts"         "compgen -G '$NGINX_DIR/sites-available/eagle-*'"
 check "no '$SVC_USER' user"     "id $SVC_USER"
+# Checked separately: 'docker inspect a b' also fails when only one is missing,
+# which would report a surviving container as gone.
+command -v docker >/dev/null 2>&1 \
+    && check "no camera containers" \
+       "docker inspect eagle-cement-go2rtc || docker inspect eagle-cement-anpr"
 
 printf '\n'
 if (( ${#FAILURES[@]} )); then
@@ -356,7 +404,7 @@ if (( LEFT || ${#FAILURES[@]} )); then
 else
     ok "Eagle Cement removed."
 fi
-printf '%s      PostgreSQL, nginx, Node, bun and the JDK were left installed.%s\n' \
+printf '%s      PostgreSQL, nginx, Node, bun, the JDK and Docker were left installed.%s\n' \
     "$C_DIM" "$C_RESET"
 (( PURGE_CONFIG )) || [[ ! -e /etc/eagle-cement ]] \
     || printf '%s      /etc/eagle-cement kept (holds API keys) — remove with --purge-config.%s\n' \

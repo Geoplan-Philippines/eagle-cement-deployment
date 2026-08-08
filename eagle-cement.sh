@@ -15,8 +15,20 @@
 # and only the backend URL differs between the two bridges. One TCP port means
 # one listener, so exactly one bridge runs at a time — see 'bridge-switch'.
 #
-# Everything binds 0.0.0.0 (except the bridge dashboard) because the readers and
-# workstations reach this box over the plant LAN.
+# The camera stack (go2rtc + the ANPR service) is shared the same way and for
+# the same reason: there is one set of gate cameras on one set of ports. It runs
+# as a docker compose project once per host, not once per instance, and both
+# APIs point at it.
+#
+#   host component  containers                         ports
+#   camera          eagle-cement-go2rtc, -anpr         1984 api, 8554 rtsp,
+#                                                      8555 tcp+udp webrtc,
+#                                                      9137 anpr
+#
+# Everything binds 0.0.0.0 except the bridge dashboard, because the readers and
+# workstations reach this box over the plant LAN. That includes go2rtc's control
+# API, which is unauthenticated — the ufw rules from 'firewall' are what confine
+# it to LAN_CIDR.
 #
 # Usage: sudo ./eagle-cement.sh <command> [instance] [component]
 # Run `./eagle-cement.sh help` for the full command list.
@@ -40,6 +52,8 @@ GIT_REF_STAGING=main
 GIT_URL_SERVER=git@github.com:Geoplan-Philippines/rfid-based-authorization-server.git
 GIT_URL_CLIENT=git@github.com:Geoplan-Philippines/rfid-based-authorization-client.git
 GIT_URL_BRIDGE=git@github.com:Geoplan-Philippines/rfid-bridge.git
+GIT_URL_CAMERA=git@github.com:Geoplan-Philippines/camera-access.git
+GIT_URL_ANPR=git@github.com:Geoplan-Philippines/anpr-service.git
 
 APP_ROOT=/opt/eagle-cement
 SVC_USER=eagle
@@ -76,6 +90,45 @@ RESEND_VERIFY_TEMPLATE_ID=
 TRANSACTION_ALERT_RECIPIENTS=
 OCR_SPACE_API_KEY=
 
+# --- camera stack (go2rtc + ANPR) ------------------------------------------
+# Shared by both instances: one set of gate cameras, one set of ports. Set
+# CAMERA_ENABLED=no on a host that has no cameras wired up yet.
+CAMERA_ENABLED=yes
+
+CCTV_DOME_URL=
+CCTV_FACE_URL=
+CCTV_PLATE_URL=
+
+GO2RTC_API_PORT=1984
+GO2RTC_RTSP_PORT=8554
+GO2RTC_WEBRTC_PORT=8555
+
+# go2rtc hands this address to the browser as its WebRTC candidate. Empty means
+# "this box's LAN address", which is what a workstation on the plant LAN needs —
+# 127.0.0.1 only ever works for a browser running on the server itself.
+GO2RTC_WEBRTC_ADDR=
+
+ANPR_PORT=9137
+ANPR_DETECTOR_MODEL=yolo-v9-t-384-license-plate-end2end
+ANPR_OCR_MODEL=cct-xs-v2-global-model
+ANPR_CONFIDENCE_THRESHOLD=0.4
+ANPR_DEVICE=cpu
+ANPR_CROP_PADDING=0
+ANPR_SAVE_WIDE_IMAGE=true
+ANPR_LOG_LEVEL=INFO
+
+# The ANPR service's own push-to-backend path. Off by default: today the NestJS
+# side pulls frames through /cctv/anpr/detect instead.
+ANPR_UPLOAD_ENABLED=false
+ANPR_UPLOAD_INSTANCE=prod
+
+# The server-side worker that polls the plate stream continuously. Only one
+# instance should record from the shared camera, so staging is off by default.
+ANPR_CONTINUOUS_PROD=true
+ANPR_CONTINUOUS_STAGING=false
+ANPR_STREAM_ID=gate_plate
+ANPR_POLL_INTERVAL_MS=1500
+
 BRIDGE_FRAME_FORMAT=AUTO_DETECT
 BRIDGE_SESSION_GAP_MS=120000
 BRIDGE_SESSION_MAX_MS=0
@@ -103,7 +156,14 @@ for _f in "$HERE/eagle-cement.conf" /etc/eagle-cement/deploy.conf; do
 done
 
 INSTANCES=(prod staging)
+
+# Per-instance components: built and run once for prod and once for staging.
 ALL_COMPONENTS=(server client bridge)
+# Host components: one shared deployment that both instances talk to.
+HOST_COMPONENTS=(camera)
+
+CAMERA_DIR="$APP_ROOT/camera"
+COMPOSE_PROJECT=eagle-cement-camera
 
 # ---------------------------------------------------------------------------
 # output helpers
@@ -162,6 +222,7 @@ load_instance() {
             GIT_REF=$GIT_REF_PROD
             JWT_SECRET=$JWT_SECRET_PROD
             BRIDGE_LOG_RAW=$BRIDGE_LOG_RAW_PROD
+            ANPR_CONTINUOUS=$ANPR_CONTINUOUS_PROD
             ;;
         staging)
             INST=staging
@@ -172,6 +233,7 @@ load_instance() {
             GIT_REF=$GIT_REF_STAGING
             JWT_SECRET=$JWT_SECRET_STAGING
             BRIDGE_LOG_RAW=$BRIDGE_LOG_RAW_STAGING
+            ANPR_CONTINUOUS=$ANPR_CONTINUOUS_STAGING
             ;;
         *) die "unknown instance '${1:-}' — expected: prod | staging | all" ;;
     esac
@@ -186,11 +248,28 @@ select_instances() {
     esac
 }
 
+# Splits the requested component into the per-instance set (looped over prod and
+# staging) and the host-level set (done once). 'camera' belongs to the host, so
+# asking for it selects no per-instance work at all.
 select_components() {
     case "${1:-all}" in
-        all)                  SELECTED_COMPONENTS=("${ALL_COMPONENTS[@]}") ;;
-        server|client|bridge) SELECTED_COMPONENTS=("$1") ;;
-        *) die "unknown component '$1' — expected: server | client | bridge | all" ;;
+        all)
+            SELECTED_COMPONENTS=("${ALL_COMPONENTS[@]}")
+            # A host with no cameras wired up yet still deploys everything else.
+            if [[ ${CAMERA_ENABLED,,} == yes ]]
+            then SELECTED_HOST_COMPONENTS=("${HOST_COMPONENTS[@]}")
+            else SELECTED_HOST_COMPONENTS=()
+            fi
+            ;;
+        server|client|bridge)
+            SELECTED_COMPONENTS=("$1")
+            SELECTED_HOST_COMPONENTS=()
+            ;;
+        camera)
+            SELECTED_COMPONENTS=()
+            SELECTED_HOST_COMPONENTS=(camera)
+            ;;
+        *) die "unknown component '$1' — expected: server | client | bridge | camera | all" ;;
     esac
 }
 
@@ -200,6 +279,8 @@ app_dir() {
         server) echo "$INST_DIR/server" ;;
         client) echo "$INST_DIR/client" ;;
         bridge) echo "$INST_DIR/bridge-src" ;;
+        camera) echo "$CAMERA_DIR/camera-access" ;;
+        anpr)   echo "$CAMERA_DIR/anpr-service" ;;
     esac
 }
 
@@ -208,6 +289,8 @@ repo_dir() {
         server) echo "rfid-based-authorization-server" ;;
         client) echo "rfid-based-authorization-client" ;;
         bridge) echo "rfid-bridge" ;;
+        camera) echo "camera-access" ;;
+        anpr)   echo "anpr-service" ;;
     esac
 }
 
@@ -216,6 +299,8 @@ git_url() {
         server) echo "$GIT_URL_SERVER" ;;
         client) echo "$GIT_URL_CLIENT" ;;
         bridge) echo "$GIT_URL_BRIDGE" ;;
+        camera) echo "$GIT_URL_CAMERA" ;;
+        anpr)   echo "$GIT_URL_ANPR" ;;
     esac
 }
 
@@ -278,6 +363,7 @@ cmd_bootstrap() {
 
     install_node
     install_bun
+    [[ ${CAMERA_ENABLED,,} == yes ]] && install_docker
 
     step "Creating service user '$SVC_USER'"
     if ! id "$SVC_USER" >/dev/null 2>&1; then
@@ -294,6 +380,16 @@ cmd_bootstrap() {
             "$INST_DIR/bridge" "$INST_DIR/bridge-src" \
             "$INST_DIR/uploads" "$INST_DIR/backups"
     done
+
+    if [[ ${CAMERA_ENABLED,,} == yes ]]; then
+        # The compose project builds and runs as root, but snapshots are read
+        # back by the API, so the tree belongs to the service user.
+        install -d -o "$SVC_USER" -g "$SVC_USER" -m 755 \
+            "$CAMERA_DIR" "$CAMERA_DIR/camera-access" "$CAMERA_DIR/anpr-service" \
+            "$CAMERA_DIR/anpr-service/snapshots" \
+            "$CAMERA_DIR/anpr-service/snapshots/wide" \
+            "$CAMERA_DIR/anpr-service/snapshots/crop_plate"
+    fi
 
     step "Enabling PostgreSQL"
     systemctl enable --now postgresql
@@ -341,6 +437,40 @@ install_bun() {
     ln -sf /opt/bun/bin/bun  /usr/local/bin/bun
     ln -sf /opt/bun/bin/bunx /usr/local/bin/bunx
     chmod -R a+rX /opt/bun
+}
+
+# The camera stack ships as containers (go2rtc upstream publishes no .deb, and
+# the ANPR service needs a pinned Python/ONNX runtime), so the host needs Docker
+# and the compose v2 plugin. Ubuntu's own docker.io is often too old to have
+# 'docker compose', so prefer Docker's apt repo and fall back to the distro
+# packages only if that is unreachable.
+install_docker() {
+    if docker compose version >/dev/null 2>&1; then
+        step "Docker $(docker --version | awk '{print $3}' | tr -d ,) with compose v2 already present"
+        systemctl enable --now docker >/dev/null 2>&1 || true
+        return
+    fi
+
+    step "Installing Docker Engine and the compose plugin"
+    install -d -m 755 /etc/apt/keyrings
+    if curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        -o /etc/apt/keyrings/docker.asc 2>/dev/null; then
+        chmod a+r /etc/apt/keyrings/docker.asc
+        local codename
+        codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+        printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
+            "$(dpkg --print-architecture)" "$codename" > /etc/apt/sources.list.d/docker.list
+        apt-get update -y -qq
+        apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
+            docker-buildx-plugin docker-compose-plugin
+    else
+        warn "download.docker.com is unreachable — falling back to the distro packages"
+        apt-get install -y -qq docker.io docker-compose-v2
+    fi
+
+    docker compose version >/dev/null 2>&1 \
+        || die "Docker is installed but 'docker compose' is not available — install the compose v2 plugin"
+    systemctl enable --now docker
 }
 
 write_systemd_units() {
@@ -429,6 +559,14 @@ cmd_init() {
         write_nginx_site
     done
     reload_nginx
+
+    # Host-level and shared, so it is written once regardless of which instance
+    # was asked for.
+    if [[ ${CAMERA_ENABLED,,} == yes ]]; then
+        head1 "Initialising the shared camera stack"
+        write_camera_config
+    fi
+
     ok "Configuration written. Next: sudo $SELF deploy ${1:-all}"
 }
 
@@ -489,6 +627,15 @@ write_server_env() {
         echo "TRANSACTION_ALERT_RECIPIENTS=$TRANSACTION_ALERT_RECIPIENTS"
         echo
         echo "OCR_SPACE_API_KEY=${OCR_SPACE_API_KEY:-null}"
+        echo
+        echo "# The camera stack is shared by both instances. It listens on all"
+        echo "# interfaces, but an API on this box takes the loopback path."
+        echo "GO2RTC_API_URL=http://127.0.0.1:$GO2RTC_API_PORT"
+        echo "ANPR_SERVICE_URL=http://127.0.0.1:$ANPR_PORT"
+        echo "# One camera, so only one instance should be recording from it."
+        echo "ANPR_CONTINUOUS_ENABLED=$([[ ${CAMERA_ENABLED,,} == yes ]] && echo "$ANPR_CONTINUOUS" || echo false)"
+        echo "ANPR_STREAM_ID=$ANPR_STREAM_ID"
+        echo "ANPR_POLL_INTERVAL_MS=$ANPR_POLL_INTERVAL_MS"
     } > "$envfile"
     chown "$SVC_USER:$SVC_USER" "$envfile"
     chmod 600 "$envfile"
@@ -594,6 +741,191 @@ reload_nginx() {
 }
 
 # ---------------------------------------------------------------------------
+# camera stack — go2rtc + the ANPR service, as one docker compose project
+#
+# Shared by both instances because the gate cameras are: one RTSP source per
+# view, one WebRTC listener, one model in memory.
+#
+# Every port is published on 0.0.0.0, so go2rtc's API, its RTSP republisher and
+# the ANPR service are all reachable from other machines on the plant LAN —
+# useful for VLC, for /docs, and for testing a detection from a workstation.
+# Note that go2rtc's control API is unauthenticated: anyone who can reach
+# GO2RTC_API_PORT can add, remove or repoint a stream. The ufw rules written by
+# 'firewall' scope that to LAN_CIDR, which is the only thing limiting it.
+#
+# The two APIs on this box still talk to the stack over 127.0.0.1 — same
+# listener, shortest path.
+# ---------------------------------------------------------------------------
+
+# Runs docker compose against the generated project. Every call is from inside
+# CAMERA_DIR because the compose file's build context and bind mounts are
+# relative to it.
+compose() {
+    ( cd "$CAMERA_DIR" && docker compose -p "$COMPOSE_PROJECT" "$@" )
+}
+
+camera_available() {
+    [[ ${CAMERA_ENABLED,,} == yes ]] || return 1
+    command -v docker >/dev/null 2>&1
+}
+
+write_camera_config() {
+    install -d -o "$SVC_USER" -g "$SVC_USER" -m 755 \
+        "$CAMERA_DIR" "$CAMERA_DIR/camera-access" "$CAMERA_DIR/anpr-service"
+    write_compose_file
+    write_go2rtc_config
+    write_anpr_env
+}
+
+write_compose_file() {
+    local file="$CAMERA_DIR/docker-compose.yml"
+    step "Writing $file"
+    cat > "$file" <<EOF
+# Generated by $SELF. Do not edit by hand — 'sudo $SELF init' rewrites it.
+name: $COMPOSE_PROJECT
+
+services:
+  # RTSP -> WebRTC/WHEP gateway and snapshot source for the gate cameras.
+  go2rtc:
+    image: alexxit/go2rtc:latest
+    container_name: eagle-cement-go2rtc
+    restart: unless-stopped
+    env_file:
+      - ./camera-access/.env
+    volumes:
+      - ./camera-access/go2rtc.yaml:/config/go2rtc.yaml:ro
+    ports:
+      # All published on 0.0.0.0 so other machines on the plant LAN can reach
+      # them directly. go2rtc's API has no authentication, so the ufw rules
+      # written by '$SELF firewall' are what keeps this to \$LAN_CIDR.
+      - "$GO2RTC_API_PORT:1984"
+      # WebRTC media: the browser connects to this one directly, over whichever
+      # transport it negotiates, so both tcp and udp.
+      - "$GO2RTC_WEBRTC_PORT:8555/tcp"
+      - "$GO2RTC_WEBRTC_PORT:8555/udp"
+      # Re-published RTSP, for VLC while commissioning.
+      - "$GO2RTC_RTSP_PORT:8554"
+
+  # Plate detection + OCR (FastAPI, CPU). The APIs post frames here for the
+  # /cctv/plate preview and for the continuous plate worker.
+  anpr-service:
+    build:
+      context: ./anpr-service
+      dockerfile: Dockerfile
+    image: eagle-cement-anpr:latest
+    container_name: eagle-cement-anpr
+    restart: unless-stopped
+    env_file:
+      - ./anpr-service/.env
+    volumes:
+      - ./anpr-service/snapshots:/service/snapshots
+      - anpr-model-cache:/root/.cache
+    # Lets the container reach an API on the host as host.docker.internal when
+    # ANPR_UPLOAD_ENABLED is turned on.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      # On the LAN too: /docs and /detect are reachable from any workstation.
+      - "$ANPR_PORT:9137"
+
+volumes:
+  # fast-alpr downloads its ONNX weights on first run; keep them across rebuilds.
+  anpr-model-cache:
+EOF
+}
+
+write_go2rtc_config() {
+    local envfile="$CAMERA_DIR/camera-access/.env"
+    local conf="$CAMERA_DIR/camera-access/go2rtc.yaml"
+    local addr=${GO2RTC_WEBRTC_ADDR:-$(lan_ip)}
+
+    step "Writing $envfile"
+    {
+        echo "# Generated by $SELF. RTSP sources for the gate cameras."
+        echo "CCTV_DOME_URL=$CCTV_DOME_URL"
+        echo "CCTV_FACE_URL=$CCTV_FACE_URL"
+        echo "CCTV_PLATE_URL=$CCTV_PLATE_URL"
+    } > "$envfile"
+    chown "$SVC_USER:$SVC_USER" "$envfile"
+    chmod 600 "$envfile"          # the RTSP URLs carry the camera passwords
+
+    step "Writing $conf (WebRTC candidate $addr:$GO2RTC_WEBRTC_PORT)"
+    cat > "$conf" <<EOF
+# Generated by $SELF for the Eagle Cement gate cameras. Do not edit by hand.
+streams:
+  # Gate Dome (PTZ / gate overview)
+  gate_dome: "\${CCTV_DOME_URL}"
+
+  # Gate Face Recognition (driver ID)
+  gate_face: "\${CCTV_FACE_URL}"
+
+  # Gate License Plate Recognition (ANPR)
+  gate_plate: "\${CCTV_PLATE_URL}"
+
+api:
+  listen: ":1984"
+  origin: "*"
+
+rtsp:
+  listen: ":8554"
+
+webrtc:
+  listen: ":8555"
+  # The address the browser is told to send media to. A workstation on the LAN
+  # cannot reach 127.0.0.1, so this has to be the address of this box.
+  candidates:
+    - $addr:$GO2RTC_WEBRTC_PORT
+EOF
+    chown "$SVC_USER:$SVC_USER" "$conf"
+
+    if [[ -z $CCTV_DOME_URL || -z $CCTV_FACE_URL || -z $CCTV_PLATE_URL ]]; then
+        warn "one or more CCTV_*_URL values are empty — those streams will not come up."
+        warn "set them in /etc/eagle-cement/deploy.conf, then: sudo $SELF init"
+    fi
+}
+
+write_anpr_env() {
+    local envfile="$CAMERA_DIR/anpr-service/.env" upload_url
+
+    # Uploads leave the container, so localhost is the container itself — the
+    # API is on the host.
+    load_instance "$ANPR_UPLOAD_INSTANCE"
+    upload_url="http://host.docker.internal:$API_PORT/api/v1/anpr/upload"
+
+    step "Writing $envfile"
+    {
+        echo "# Generated by $SELF for the shared camera stack."
+        echo "# Re-run 'sudo $SELF init' to refresh it."
+        echo "APP_HOST=0.0.0.0"
+        echo "APP_PORT=9137"
+        echo "LOG_LEVEL=$ANPR_LOG_LEVEL"
+        echo
+        echo "ALPR_DETECTOR_MODEL=$ANPR_DETECTOR_MODEL"
+        echo "ALPR_OCR_MODEL=$ANPR_OCR_MODEL"
+        echo "CONFIDENCE_THRESHOLD=$ANPR_CONFIDENCE_THRESHOLD"
+        echo "DEVICE=$ANPR_DEVICE"
+        echo "MAX_CONCURRENT_INFERENCES=1"
+        echo
+        echo "# Paths inside the container; the snapshots tree is bind-mounted"
+        echo "# from $CAMERA_DIR/anpr-service/snapshots."
+        echo "CROP_OUTPUT_DIR=snapshots/crop_plate"
+        echo "RAW_IMAGES_DIR=snapshots/wide"
+        echo "CROP_PADDING=$ANPR_CROP_PADDING"
+        echo "SAVE_WIDE_IMAGE=$ANPR_SAVE_WIDE_IMAGE"
+        echo
+        echo "# Push-to-backend. Off by default: the API pulls detections through"
+        echo "# /cctv/anpr/detect instead of the service pushing them."
+        echo "NESTJS_UPLOAD_URL=$upload_url"
+        echo "UPLOAD_ENABLED=$ANPR_UPLOAD_ENABLED"
+        echo "UPLOAD_ON_LOCAL_DETECT=false"
+        echo "UPLOAD_TIMEOUT_SECONDS=10"
+        echo "NESTJS_API_KEY="
+    } > "$envfile"
+    chown "$SVC_USER:$SVC_USER" "$envfile"
+    chmod 600 "$envfile"
+}
+
+# ---------------------------------------------------------------------------
 # deploy
 # ---------------------------------------------------------------------------
 
@@ -602,10 +934,20 @@ cmd_deploy() {
     select_instances "${1:-all}"
     select_components "${2:-all}"
 
+    # The shared camera stack first, and once — it is what the instances' ANPR
+    # workers connect to, and it is not per-instance work. It also leaves
+    # load_instance's variables pointing at ANPR_UPLOAD_INSTANCE, so it has to
+    # happen before the loop below re-loads them.
+    local hcomp
+    for hcomp in ${SELECTED_HOST_COMPONENTS[@]+"${SELECTED_HOST_COMPONENTS[@]}"}; do
+        head1 "Deploying $hcomp (shared by both instances)"
+        "deploy_$hcomp"
+    done
+
     local inst comp
     for inst in "${SELECTED_INSTANCES[@]}"; do
         load_instance "$inst"
-        for comp in "${SELECTED_COMPONENTS[@]}"; do
+        for comp in ${SELECTED_COMPONENTS[@]+"${SELECTED_COMPONENTS[@]}"}; do
             head1 "Deploying $comp → $INST"
             sync_source "$comp"
             "deploy_$comp"
@@ -623,7 +965,11 @@ sync_source() {
     dest=$(app_dir "$comp")
 
     if [[ $SOURCE_MODE == git ]]; then
-        src="$APP_ROOT/checkout/$INST/$comp"
+        # The camera repos are host-level: one checkout, not one per instance.
+        case "$comp" in
+            camera|anpr) src="$APP_ROOT/checkout/host/$comp" ;;
+            *)           src="$APP_ROOT/checkout/$INST/$comp" ;;
+        esac
         fetch_checkout "$comp" "$src"
     else
         src="$SRC_ROOT/$(repo_dir "$comp")"
@@ -642,10 +988,11 @@ sync_source() {
     # dist/main.js. Build state must never travel between hosts.
     rsync -a --delete \
         --exclude '.git' --exclude 'node_modules' --exclude '.env' \
-        --exclude '*.tsbuildinfo' \
+        --exclude '*.tsbuildinfo' --exclude '__pycache__' \
         --exclude '/dist' --exclude '/build' --exclude '/out' \
         --exclude '/target' --exclude '/.angular' \
-        --exclude '/uploads' --exclude '/backups' \
+        --exclude '/.venv' --exclude '/venv' \
+        --exclude '/uploads' --exclude '/backups' --exclude '/snapshots' \
         "$src/" "$dest/"
     chown -R "$SVC_USER:$SVC_USER" "$dest"
 }
@@ -752,6 +1099,68 @@ EOF
     else
         warn "nginx did not answer on :$WEB_PORT — check: $SELF logs $INST nginx"
     fi
+}
+
+deploy_camera() {
+    [[ ${CAMERA_ENABLED,,} == yes ]] \
+        || die "CAMERA_ENABLED is not 'yes' — nothing to deploy"
+    command -v docker >/dev/null 2>&1 \
+        || die "docker is not installed — run: sudo $SELF bootstrap"
+
+    # Host-level, so there is no instance ref to follow; the camera stack tracks
+    # whatever production tracks.
+    GIT_REF=$GIT_REF_PROD
+
+    sync_source camera
+    sync_source anpr
+
+    # Written after the sync: rsync --delete would otherwise replace the
+    # generated go2rtc.yaml with the repo's development copy.
+    write_camera_config
+
+    install -d -o "$SVC_USER" -g "$SVC_USER" -m 755 \
+        "$CAMERA_DIR/anpr-service/snapshots" \
+        "$CAMERA_DIR/anpr-service/snapshots/wide" \
+        "$CAMERA_DIR/anpr-service/snapshots/crop_plate"
+
+    step "Pulling go2rtc and building the ANPR image"
+    compose pull --quiet go2rtc || warn "could not pull go2rtc — using the cached image"
+    compose build anpr-service
+
+    step "Starting the camera stack"
+    compose up -d --remove-orphans
+
+    # First boot downloads the ONNX weights, which is slow on a plant link, so
+    # give the ANPR service noticeably longer than the other health waits.
+    if wait_for_http "http://127.0.0.1:$GO2RTC_API_PORT/api/streams" 30; then
+        ok "go2rtc answering on :$GO2RTC_API_PORT"
+        camera_stream_report
+    else
+        warn "go2rtc did not answer in time — check: $SELF logs camera"
+    fi
+
+    if wait_for_http "http://127.0.0.1:$ANPR_PORT/health" 180; then
+        ok "ANPR service healthy on :$ANPR_PORT"
+    else
+        warn "the ANPR service did not answer /health in time (first run downloads"
+        warn "the ONNX weights) — check: $SELF logs camera"
+    fi
+}
+
+# go2rtc reports a stream as configured whether or not the camera answers, so
+# say which ones actually have a producer attached.
+camera_stream_report() {
+    local body
+    body=$(curl -fsS --max-time 5 "http://127.0.0.1:$GO2RTC_API_PORT/api/streams" 2>/dev/null) || return 0
+    local name
+    while read -r name; do
+        [[ -n $name ]] || continue
+        if curl -fsS --max-time 8 -o /dev/null \
+            "http://127.0.0.1:$GO2RTC_API_PORT/api/frame.jpeg?src=$name" 2>/dev/null
+        then ok "  stream '$name' is producing frames"
+        else warn "  stream '$name' is configured but produced no frame — check the RTSP URL"
+        fi
+    done < <(jq -r 'keys[]' <<<"$body" 2>/dev/null)
 }
 
 # Which instance's bridge service is currently up, or empty if none. Only
@@ -1043,6 +1452,22 @@ EOF
     reload_nginx
 }
 
+cmd_camera() {
+    local sub=${1:-streams}
+    camera_available || die "the camera stack is not enabled or docker is missing"
+    case "$sub" in
+        streams)
+            head1 "go2rtc streams on 127.0.0.1:$GO2RTC_API_PORT"
+            camera_stream_report
+            printf '\n  %sWebRTC candidate handed to browsers: %s%s\n\n' "$C_DIM" \
+                "$(sed -n 's/^    - //p' "$CAMERA_DIR/camera-access/go2rtc.yaml" 2>/dev/null | tail -1)" \
+                "$C_RESET"
+            ;;
+        ps) compose ps ;;
+        *)  die "usage: $SELF camera <streams|ps>" ;;
+    esac
+}
+
 cmd_bridge_ui() {
     select_instances "${1:-all}"
     local inst
@@ -1074,16 +1499,37 @@ unit_for() {
     esac
 }
 
+# The camera stack is containers rather than a systemd unit, so start/stop/
+# restart go through compose. 'start' is 'up -d' so it also works the first time,
+# before the containers have been created.
+camera_action() {
+    case "$1" in
+        start)   compose up -d ;;
+        stop)    compose stop ;;
+        restart) compose restart ;;
+    esac
+}
+
 svc_action() {
     local action=$1
     need_root "$action" "${@:2}"
     select_instances "${2:-all}"
     select_components "${3:-all}"
 
+    local hcomp
+    for hcomp in ${SELECTED_HOST_COMPONENTS[@]+"${SELECTED_HOST_COMPONENTS[@]}"}; do
+        if [[ ! -f $CAMERA_DIR/docker-compose.yml ]]; then
+            step "camera stack is not deployed — skipping"
+            continue
+        fi
+        step "docker compose $action ($hcomp)"
+        camera_action "$action"
+    done
+
     local inst comp unit
     for inst in "${SELECTED_INSTANCES[@]}"; do
         load_instance "$inst"
-        for comp in "${SELECTED_COMPONENTS[@]}"; do
+        for comp in ${SELECTED_COMPONENTS[@]+"${SELECTED_COMPONENTS[@]}"}; do
             unit=$(unit_for "$comp" "$inst")
             if [[ -z $unit ]]; then
                 step "client is served by nginx — ${action}ing nginx instead"
@@ -1108,8 +1554,36 @@ cmd_status() {
         printf '  %-8s %s\n' api      "$(unit_state "eagle-api@$inst")  http://$ip:$API_PORT/api/v1"
         printf '  %-8s %s\n' client   "$(nginx_state)  http://$ip:$WEB_PORT/"
         printf '  %-8s %s\n' bridge   "$(unit_state "eagle-bridge@$inst")  reader → $ip:$BRIDGE_PORT $(bridge_owner_note "$inst")"
+        printf '  %-8s %s\n' anpr     "$(anpr_worker_note)  stream '$ANPR_STREAM_ID' every ${ANPR_POLL_INTERVAL_MS}ms"
     done
+
+    if [[ ${CAMERA_ENABLED,,} == yes ]]; then
+        head1 "camera (shared)"
+        printf '  %-8s %s\n' go2rtc "$(container_state eagle-cement-go2rtc)  http://$ip:$GO2RTC_API_PORT/  webrtc $ip:$GO2RTC_WEBRTC_PORT"
+        printf '  %-8s %s\n' anpr   "$(container_state eagle-cement-anpr)  http://$ip:$ANPR_PORT/docs"
+    fi
     echo
+}
+
+# Whether this instance's API is the one recording plates. Read from the .env
+# the script generated, not from the config, so it reflects what is deployed.
+anpr_worker_note() {
+    local envfile="$INST_DIR/server/.env" v=
+    [[ -r $envfile ]] && v=$(sed -n 's/^ANPR_CONTINUOUS_ENABLED=//p' "$envfile" | head -1)
+    case "$v" in
+        true)  printf '%s%-8s%s %-9s' "$C_GREEN" recording "$C_RESET" '(worker)' ;;
+        false) printf '%s%-8s%s %-9s' "$C_DIM" off "$C_RESET" '(worker)' ;;
+        *)     printf '%s%-8s%s %-9s' "$C_YELLOW" unknown "$C_RESET" '(worker)' ;;
+    esac
+}
+
+container_state() {
+    local st
+    st=$(docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null) || st=missing
+    case "$st" in
+        running) printf '%s%-8s%s %-9s' "$C_GREEN" running "$C_RESET" '(docker)' ;;
+        *)       printf '%s%-8s%s %-9s' "$C_RED" "$st" "$C_RESET" '(docker)' ;;
+    esac
 }
 
 # Both bridges want the one reader port, so 'not listening' is the normal
@@ -1182,6 +1656,19 @@ cmd_health() {
             check "bridge reader port :$BRIDGE_PORT" port_probe "$BRIDGE_PORT" || rc=1
         fi
     done
+
+    if [[ ${CAMERA_ENABLED,,} == yes ]]; then
+        head1 "camera (shared)"
+        check "go2rtc /api/streams on :$GO2RTC_API_PORT" \
+            curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1:$GO2RTC_API_PORT/api/streams" || rc=1
+        check "anpr   /health on :$ANPR_PORT" \
+            curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1:$ANPR_PORT/health" || rc=1
+        # A configured stream with no producer is the usual camera fault, and it
+        # is invisible from /api/streams alone.
+        check "camera frame from '$ANPR_STREAM_ID'" \
+            curl -fsS --max-time 10 -o /dev/null \
+            "http://127.0.0.1:$GO2RTC_API_PORT/api/frame.jpeg?src=$ANPR_STREAM_ID" || rc=1
+    fi
     echo
     return $rc
 }
@@ -1208,6 +1695,20 @@ check() {
 cmd_logs() {
     local inst=${1:-} comp=${2:-server}
     [[ -n $inst ]] || die "usage: $SELF logs <prod|staging> <server|bridge|nginx> [-f]"
+
+    # The camera stack has no instance, so it is addressed directly:
+    #   logs camera [go2rtc|anpr-service] [-f]
+    if [[ $inst == camera ]]; then
+        shift
+        local svc=()
+        [[ ${1:-} == go2rtc || ${1:-} == anpr-service ]] && { svc=("$1"); shift; }
+        [[ -f $CAMERA_DIR/docker-compose.yml ]] \
+            || die "the camera stack is not deployed — run: sudo $SELF deploy all camera"
+        cd "$CAMERA_DIR" || die "cannot enter $CAMERA_DIR"
+        exec docker compose -p "$COMPOSE_PROJECT" logs --tail 200 \
+            "$@" ${svc[@]+"${svc[@]}"}
+    fi
+
     load_instance "$inst"
     shift 2 2>/dev/null || shift $#
     case "$comp" in
@@ -1229,6 +1730,15 @@ cmd_urls() {
             "$C_BOLD" "$INST" "$C_RESET" \
             "http://$ip:$WEB_PORT/" "http://$ip:$API_PORT/api/v1" "$ip" "$BRIDGE_PORT"
     done
+    if [[ ${CAMERA_ENABLED,,} == yes ]]; then
+        printf '  %s%-8s%s go2rtc %-26s anpr %s\n' \
+            "$C_BOLD" camera "$C_RESET" \
+            "http://$ip:$GO2RTC_API_PORT/" "http://$ip:$ANPR_PORT/docs"
+        printf '  %s         webrtc %s:%s (tcp+udp)   rtsp rtsp://%s:%s/<stream>%s\n' \
+            "$C_DIM" "$ip" "$GO2RTC_WEBRTC_PORT" "$ip" "$GO2RTC_RTSP_PORT" "$C_RESET"
+        printf '  %s         go2rtc'"'"'s API is unauthenticated — keep it inside LAN_CIDR.%s\n' \
+            "$C_DIM" "$C_RESET"
+    fi
     local holder; holder=$(bridge_port_holder)
     printf '\n  %sOn each reader set Destination IP to %s and Destination Port to %s.%s\n' \
         "$C_DIM" "$ip" "$BRIDGE_PORT" "$C_RESET"
@@ -1262,6 +1772,19 @@ cmd_firewall() {
             ufw allow from "$cidr" to any port "$BRIDGE_UI_PORT" proto tcp >/dev/null
         fi
     done
+
+    if [[ ${CAMERA_ENABLED,,} == yes ]]; then
+        # The camera stack publishes every port on 0.0.0.0, so these rules are
+        # what confines it to the plant LAN. go2rtc's control API is
+        # unauthenticated — keep $cidr as tight as the site allows.
+        for p in "$GO2RTC_API_PORT" "$GO2RTC_RTSP_PORT" "$GO2RTC_WEBRTC_PORT" "$ANPR_PORT"; do
+            step "allow $cidr → tcp/$p (camera stack)"
+            ufw allow from "$cidr" to any port "$p" proto tcp >/dev/null
+        done
+        # WebRTC media negotiates over either transport, so udp as well.
+        step "allow $cidr → udp/$GO2RTC_WEBRTC_PORT (camera WebRTC)"
+        ufw allow from "$cidr" to any port "$GO2RTC_WEBRTC_PORT" proto udp >/dev/null
+    fi
     ok "Rules added. Turn the firewall on with: sudo ufw enable"
 }
 
@@ -1301,8 +1824,9 @@ cmd_destroy() {
     reload_nginx
 
     # What is left is host-level and shared, so removing it is a separate,
-    # deliberate step — see 'purge-host' in INSTALL.md §12.
-    warn "The systemd units, the '$SVC_USER' user/role and $APP_ROOT still exist."
+    # deliberate step — see 'purge-host' in INSTALL.md §12. The camera stack in
+    # particular is shared, so destroying one instance must not take it down.
+    warn "The systemd units, the camera stack, the '$SVC_USER' user/role and $APP_ROOT still exist."
     warn "To remove those too: sudo $SELF purge-host"
 }
 
@@ -1319,10 +1843,17 @@ cmd_purge_host() {
         die "still installed: ${remaining[*]} — run '$SELF destroy all' first"
     fi
 
-    warn "This removes the systemd units, the '$SVC_USER' user and PostgreSQL role,"
+    warn "This removes the systemd units, the camera stack (containers, images and"
+    warn "the saved plate snapshots), the '$SVC_USER' user and PostgreSQL role,"
     warn "$APP_ROOT (including the saved database password), the eaglectl symlink"
     warn "and the ufw rules. Config at /etc/eagle-cement is left alone."
     confirm "Purge the host-level install?" || die "aborted"
+
+    if [[ -f $CAMERA_DIR/docker-compose.yml ]] && command -v docker >/dev/null 2>&1; then
+        step "Removing the camera stack (containers, network and model cache)"
+        compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+        docker image rm -f eagle-cement-anpr:latest >/dev/null 2>&1 || true
+    fi
 
     step "Removing systemd units"
     rm -f /etc/systemd/system/eagle-api@.service \
@@ -1346,6 +1877,12 @@ cmd_purge_host() {
                     >/dev/null 2>&1 || true
             done
         done
+        for port in "$GO2RTC_API_PORT" "$GO2RTC_RTSP_PORT" "$GO2RTC_WEBRTC_PORT" "$ANPR_PORT"; do
+            ufw --force delete allow from "$cidr" to any port "$port" proto tcp \
+                >/dev/null 2>&1 || true
+        done
+        ufw --force delete allow from "$cidr" to any port "$GO2RTC_WEBRTC_PORT" proto udp \
+            >/dev/null 2>&1 || true
     fi
 
     step "Removing $APP_ROOT and the eaglectl symlink"
@@ -1355,7 +1892,7 @@ cmd_purge_host() {
     step "Removing the service user '$SVC_USER'"
     id "$SVC_USER" >/dev/null 2>&1 && userdel "$SVC_USER" 2>/dev/null || true
 
-    ok "Host purged. PostgreSQL, nginx, Node, bun and the JDK were left installed."
+    ok "Host purged. PostgreSQL, nginx, Node, bun, the JDK and Docker were left installed."
 }
 
 # ---------------------------------------------------------------------------
@@ -1369,19 +1906,24 @@ ${C_BOLD}eagle-cement.sh $VERSION${C_RESET} — two-instance deployment for the 
   ${C_BOLD}usage${C_RESET}   sudo $SELF <command> [instance] [component]
 
   instance    prod | staging | all          (default: all)
-  component   server | client | bridge | all (default: all)
+  component   server | client | bridge | camera | all (default: all)
+
+              'camera' is the shared go2rtc + ANPR container stack. There is one
+              set of gate cameras, so it is deployed once for the host and both
+              instances point at it — it is not per-instance.
 
 ${C_BOLD}setup${C_RESET}
-  bootstrap                   install packages, service user and systemd units (run once)
-  init [instance]             create the database, write .env, bridge.properties and nginx
+  bootstrap                   install packages, Docker, service user and systemd units (run once)
+  init [instance]             create the database, write .env, bridge.properties, nginx and camera config
   deploy [instance] [comp]    sync source, build, migrate, restart
   firewall                    open the LAN ports in ufw for \$LAN_CIDR
 
 ${C_BOLD}day to day${C_RESET}
   status [instance]           what is running, and where
-  health [instance]           probe the API, web, database and reader port
+  health [instance]           probe the API, web, database, reader port and cameras
   urls [instance]             LAN URLs, and the port each reader should dial
   logs <instance> <server|bridge|nginx> [-f]
+  logs camera [go2rtc|anpr-service] [-f]
   start | stop | restart [instance] [comp]
 
 ${C_BOLD}database${C_RESET}
@@ -1395,6 +1937,11 @@ ${C_BOLD}rfid bridge${C_RESET}
   bridge-key <instance>       mint an API key and load it into bridge.properties
   bridge-ui [instance]        show the dashboard URL and the SSH tunnel command
   bridge-switch <instance>    hand the shared reader port to that instance
+
+${C_BOLD}cameras${C_RESET}
+  camera streams              list the go2rtc streams and whether each is producing frames
+  camera ps                   docker compose ps for the camera stack
+                              (go2rtc :$GO2RTC_API_PORT and anpr :$ANPR_PORT are open on the LAN)
 
 ${C_BOLD}teardown${C_RESET}
   destroy <prod|staging|all>  remove instances: services, files, uploads and database
@@ -1427,6 +1974,7 @@ main() {
         bridge-key)     cmd_bridge_key "$@" ;;
         bridge-ui)      cmd_bridge_ui "$@" ;;
         bridge-switch)  cmd_bridge_switch "$@" ;;
+        camera)         cmd_camera "$@" ;;
         firewall)       cmd_firewall "$@" ;;
         status)         cmd_status "$@" ;;
         health)         cmd_health "$@" ;;
