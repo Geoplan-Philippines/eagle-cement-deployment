@@ -1463,8 +1463,12 @@ cmd_camera() {
                 "$(sed -n 's/^    - //p' "$CAMERA_DIR/camera-access/go2rtc.yaml" 2>/dev/null | tail -1)" \
                 "$C_RESET"
             ;;
-        ps) compose ps ;;
-        *)  die "usage: $SELF camera <streams|ps>" ;;
+        ps|status) compose ps ;;
+        start)     need_root camera start; camera_action start; ok "camera stack started" ;;
+        stop)      need_root camera stop; camera_action stop; ok "camera stack stopped" ;;
+        restart)   need_root camera restart; camera_action restart; ok "camera stack restarted" ;;
+        logs)      shift; compose logs --tail=200 "$@" ;;
+        *)         die "usage: $SELF camera <streams|ps|status|start|stop|restart|logs>" ;;
     esac
 }
 
