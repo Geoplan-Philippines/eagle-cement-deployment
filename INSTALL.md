@@ -798,54 +798,164 @@ it again. See §12 for the full range of removal options.
   address changes, re-run `init` and restart the API. The UI itself does not
   care — it is same-origin.
 
-## 11. Command reference
+## 11. Command Reference & Operational Playbooks
 
-```
+### 11.1 Master Command Syntax
+
+```bash
 sudo eaglectl <command> [instance] [component]
-
-  instance    prod | staging | all           (default: all)
-  component   server | client | bridge | camera | all (default: all)
-              'camera' is host-level and shared — deployed once, not per instance
-
-setup
-  bootstrap                   install packages, Docker, service user and systemd units
-  init [instance]             create the database, write .env / bridge.properties / nginx / camera config
-  deploy [instance] [comp]    sync source, build, migrate, restart
-  firewall                    open the LAN ports in ufw
-
-day to day
-  status [instance]           what is running, and where
-  health [instance]           probe API, web, database, reader port and cameras
-  urls [instance]             LAN URLs and the port each reader should dial
-  logs <instance> <server|bridge|nginx> [-f]
-  logs camera [go2rtc|anpr-service] [-f]
-  start | stop | restart [instance] [comp]
-
-database
-  migrate [instance]          prisma migrate deploy
-  seed <instance> [prod|demo]
-  backup [instance]           pg_dump -Fc into <instance>/backups
-  restore <instance> <file>
-  psql <instance>
-
-rfid bridge
-  bridge-key <instance>       mint an API key into bridge.properties
-  bridge-ui [instance]        dashboard URL and SSH tunnel command
-  bridge-switch <instance>    hand the shared reader port to that instance
-
-cameras
-  camera streams              which go2rtc streams are producing frames
-  camera ps                   docker compose ps for the camera stack
-
-teardown
-  destroy <prod|staging|all>  remove instances: services, files, uploads, database
-                              (the shared camera stack is left running)
-  purge-host                  after 'destroy all': systemd units, camera stack,
-                              eagle user/role, /opt
-
-./eagle-cement-uninstall.sh [--dry-run] [--yes] [--purge-config]
-                            remove the entire stack in one command (§12.0)
+# or:
+sudo ./eagle-cement.sh <command> [instance] [component]
 ```
+
+* **`instance`**: `prod` | `staging` | `all` *(default: `all`)*
+* **`component`**: `server` | `client` | `bridge` | `camera` | `all` *(default: `all`)*
+
+---
+
+### 11.2 Command Matrix
+
+| Category | Command | Description | Example |
+| :--- | :--- | :--- | :--- |
+| **System** | `bootstrap` | Install dependencies (Postgres, Nginx, Node, Bun, Docker, JDK) | `sudo eaglectl bootstrap` |
+| | `init [inst]` | Generate DB, `.env`, nginx sites, camera and bridge configs | `sudo eaglectl init all` |
+| | `deploy [inst] [comp]` | Sync source, build bundles, run migrations, reload services | `sudo eaglectl deploy prod server` |
+| | `firewall` | Configure UFW firewall rules for plant LAN CIDR | `sudo eaglectl firewall` |
+| | `version` | Print script version | `sudo eaglectl version` |
+| **Monitoring** | `status [inst]` | Check status of API, client, DB, bridge ownership, and cameras | `sudo eaglectl status` |
+| | `health [inst]` | Probe HTTP endpoints, DB connectivity, and active reader ports | `sudo eaglectl health` |
+| | `urls [inst]` | Display all LAN URLs, Web UI, API, and reader dial-in ports | `sudo eaglectl urls` |
+| **Service Control** | `start [inst] [comp]` | Start systemd services or camera stack | `sudo eaglectl start prod` |
+| | `stop [inst] [comp]` | Stop systemd services or camera stack | `sudo eaglectl stop staging` |
+| | `restart [inst] [comp]`| Restart systemd services or camera stack | `sudo eaglectl restart all` |
+| **Logs** | `logs <inst> <server\|bridge\|nginx> [-f]` | Tail service logs | `sudo eaglectl logs prod server -f` |
+| | `logs camera [go2rtc\|anpr-service] [-f]` | Follow camera container logs | `sudo eaglectl logs camera -f` |
+| **Database** | `migrate [inst]` | Run Prisma migrations (`prisma migrate deploy`) | `sudo eaglectl migrate prod` |
+| | `seed <inst> [prod\|demo]` | Load baseline production or demo dataset | `sudo eaglectl seed prod prod` |
+| | `backup [inst]` | Generate `pg_dump` in `/opt/eagle-cement/<inst>/backups/` | `sudo eaglectl backup prod` |
+| | `restore <inst> <file>` | Restore a PostgreSQL dump over target instance database | `sudo eaglectl restore staging /path/to/dump.sql` |
+| | `psql <inst>` | Open an interactive `psql` shell into target database | `sudo eaglectl psql prod` |
+| **RFID Bridge** | `bridge-switch <inst>` | **Hand the physical reader port (20059) to target instance** | `sudo eaglectl bridge-switch prod` |
+| | `bridge-key <inst>` | Generate an API key and inject into `bridge.properties` | `sudo eaglectl bridge-key prod` |
+| | `bridge-ui [inst]` | Print bridge web dashboard URL and SSH tunnel command | `sudo eaglectl bridge-ui` |
+| **Camera Gateway** | `camera streams` | Verify live frame production on all go2rtc camera feeds | `sudo eaglectl camera streams` |
+| | `camera ps` | List camera Docker container statuses (`go2rtc` & `anpr`) | `sudo eaglectl camera ps` |
+| | `camera restart` | Restart the go2rtc & ANPR container stack | `sudo eaglectl camera restart` |
+| | `camera logs [-f]` | Tail camera container logs | `sudo eaglectl camera logs -f` |
+| **Teardown** | `destroy <inst\|all>` | Remove instances (services, code, DB, uploads) | `sudo eaglectl destroy staging` |
+| | `purge-host` | Remove template units, service user, `/opt/eagle-cement` | `sudo eaglectl purge-host` |
+
+---
+
+### 11.3 Key Operational Playbooks
+
+#### 🔄 Playbook A: Switching Hardware from Staging to Production
+When you are ready to cut live plant operations over to **Production**:
+
+1. **Switch the Physical RFID Reader**:
+   ```bash
+   sudo eaglectl bridge-switch prod
+   ```
+   *(Stops staging bridge on port 20059 and starts prod bridge; verify with `sudo eaglectl status`)*
+
+2. **Ensure Continuous ANPR Recording is on Prod**:
+   In your `/etc/eagle-cement/deploy.conf` (or `eagle-cement.conf`):
+   ```bash
+   ANPR_CONTINUOUS_PROD=true
+   ANPR_CONTINUOUS_STAGING=false
+   ```
+   Then apply and reload the APIs:
+   ```bash
+   sudo eaglectl init all
+   sudo eaglectl restart all server
+   ```
+
+3. **Verify Everything is Active**:
+   ```bash
+   sudo eaglectl status
+   sudo eaglectl camera streams
+   ```
+
+---
+
+#### 🔄 Playbook B: Switching Hardware from Production to Staging (Testing Mode)
+When testing new RFID readers, bridges, or plate reading features without affecting production:
+
+1. **Hand the Reader Port to Staging**:
+   ```bash
+   sudo eaglectl bridge-switch staging
+   ```
+
+2. **Direct ANPR Recording to Staging (Optional)**:
+   In `/etc/eagle-cement/deploy.conf`:
+   ```bash
+   ANPR_CONTINUOUS_PROD=false
+   ANPR_CONTINUOUS_STAGING=true
+   ```
+   Apply and restart:
+   ```bash
+   sudo eaglectl init all
+   sudo eaglectl restart all server
+   ```
+
+3. **Switch Back to Production When Testing Finishes**:
+   ```bash
+   sudo eaglectl bridge-switch prod
+   ```
+
+---
+
+#### 🚀 Playbook C: Deploying Code Changes
+
+* **Deploying Backend API only**:
+  ```bash
+  sudo eaglectl deploy prod server
+  ```
+* **Deploying Frontend Web UI only**:
+  ```bash
+  sudo eaglectl deploy prod client
+  ```
+* **Deploying Camera & ANPR stack only**:
+  ```bash
+  sudo eaglectl deploy all camera
+  ```
+* **Deploying Everything to Staging first, then Prod**:
+  ```bash
+  # Step 1: Deploy & test on staging
+  sudo eaglectl deploy staging all
+  sudo eaglectl health staging
+
+  # Step 2: Deploy to prod
+  sudo eaglectl deploy prod all
+  sudo eaglectl health prod
+  ```
+
+---
+
+#### 🛠️ Playbook D: Troubleshooting & Diagnostics
+
+* **View live backend logs**:
+  ```bash
+  sudo eaglectl logs prod server -f
+  ```
+* **View live RFID bridge logs**:
+  ```bash
+  sudo eaglectl logs prod bridge -f
+  ```
+* **View camera stream health**:
+  ```bash
+  sudo eaglectl camera streams
+  ```
+* **Database manual query**:
+  ```bash
+  sudo eaglectl psql prod
+  # Inside psql: \dt, SELECT count(*) FROM transactions;
+  ```
+* **Take an ad-hoc database backup**:
+  ```bash
+  sudo eaglectl backup prod
+  # Backup file is saved in /opt/eagle-cement/prod/backups/
+  ```
 
 ## 12. Removing the installation
 
