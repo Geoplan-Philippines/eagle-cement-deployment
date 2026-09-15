@@ -180,9 +180,18 @@ ANPR_UPLOAD_INSTANCE=prod
 # so this is the camera's equivalent of 'bridge-switch': leave staging off
 # unless you deliberately want it reading the gate instead of prod.
 ANPR_CONTINUOUS_PROD=true
-ANPR_CONTINUOUS_STAGING=false
 ANPR_STREAM_ID=gate_plate
 ANPR_POLL_INTERVAL_MS=1500
+
+# --- barrier trigger (camera alarm out relay) --------------------------------
+# Dahua barrier triggered by shorting OPEN to GND via the ANPR plate camera's
+# ALARM_OUT (Brown) and ALARM_OUT_GND (Green) wires.
+BARRIER_CAMERA_HOST=192.168.10.235
+BARRIER_CAMERA_PORT=80
+BARRIER_CAMERA_USER=admin
+BARRIER_CAMERA_PASSWORD=admin123
+BARRIER_TRIGGER_ENABLED=true
+BARRIER_PULSE_DURATION_MS=800
 
 # --- firewall ---------------------------------------------------------------
 # CIDR allowed to reach the LAN-facing ports when `firewall` runs. Left empty,
