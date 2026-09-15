@@ -164,10 +164,8 @@ else
 fi
 
 if command -v docker >/dev/null 2>&1; then
-    for c in eagle-cement-go2rtc eagle-cement-anpr; do
-        docker inspect "$c" >/dev/null 2>&1 && note_found "container $c"
-    done
-    [[ -d $CAMERA_DIR ]] && note_found "camera stack in $CAMERA_DIR (plate snapshots included)"
+    docker inspect eagle-cement-go2rtc >/dev/null 2>&1 && note_found "container eagle-cement-go2rtc"
+    [[ -d $CAMERA_DIR ]] && note_found "camera stack in $CAMERA_DIR"
 fi
 
 id "$SVC_USER" >/dev/null 2>&1 && note_found "system user $SVC_USER"
@@ -223,20 +221,13 @@ done
 if command -v docker >/dev/null 2>&1; then
     log "Removing the camera stack"
     if [[ -f $CAMERA_DIR/docker-compose.yml ]]; then
-        step "docker compose down (containers, network and model cache)"
+        step "docker compose down"
         run bash -c "cd '$CAMERA_DIR' && docker compose -p '$COMPOSE_PROJECT' down --volumes --remove-orphans"
     else
-        for c in eagle-cement-go2rtc eagle-cement-anpr; do
-            if docker inspect "$c" >/dev/null 2>&1; then
-                step "removing container $c"
-                run docker rm -f "$c"
-            fi
-        done
-        run docker volume rm -f "${COMPOSE_PROJECT}_anpr-model-cache"
-    fi
-    if docker image inspect eagle-cement-anpr:latest >/dev/null 2>&1; then
-        step "removing image eagle-cement-anpr:latest"
-        run docker image rm -f eagle-cement-anpr:latest
+        if docker inspect eagle-cement-go2rtc >/dev/null 2>&1; then
+            step "removing container eagle-cement-go2rtc"
+            run docker rm -f eagle-cement-go2rtc
+        fi
     fi
 fi
 
@@ -392,7 +383,7 @@ check "no '$SVC_USER' user"     "id $SVC_USER"
 # which would report a surviving container as gone.
 command -v docker >/dev/null 2>&1 \
     && check "no camera containers" \
-       "docker inspect eagle-cement-go2rtc || docker inspect eagle-cement-anpr"
+       "docker inspect eagle-cement-go2rtc"
 
 printf '\n'
 if (( ${#FAILURES[@]} )); then

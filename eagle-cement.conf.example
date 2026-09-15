@@ -29,7 +29,6 @@ GIT_URL_SERVER=git@github.com:Geoplan-Philippines/rfid-based-authorization-serve
 GIT_URL_CLIENT=git@github.com:Geoplan-Philippines/rfid-based-authorization-client.git
 GIT_URL_BRIDGE=git@github.com:Geoplan-Philippines/rfid-bridge.git
 GIT_URL_CAMERA=git@github.com:Geoplan-Philippines/camera-access.git
-GIT_URL_ANPR=git@github.com:Geoplan-Philippines/anpr-service.git
 
 # --- where it gets installed ------------------------------------------------
 APP_ROOT=/opt/eagle-cement
