@@ -83,6 +83,7 @@ JWT_SECRET_STAGING=
 
 RESEND_API_KEY=
 RESEND_EAGLE_CEMENT_TEMPLATE_ID=
+RESEND_BAN_ALERT_TEMPLATE_ID=banned-truck-alert
 RESEND_FROM_EMAIL=
 RESEND_VERIFY_TEMPLATE_ID=
 TRANSACTION_ALERT_RECIPIENTS=
@@ -96,6 +97,7 @@ CAMERA_ENABLED=yes
 CCTV_DOME_URL=
 CCTV_FACE_URL=
 CCTV_PLATE_URL=
+CCTV_PLATE_HD_URL=
 
 GO2RTC_API_PORT=1984
 GO2RTC_RTSP_PORT=8554
@@ -135,6 +137,10 @@ BRIDGE_LOG_RAW_STAGING=true
 BRIDGE_UI_EXPOSE=no
 BRIDGE_UI_PORT_PROD=20090
 BRIDGE_UI_PORT_STAGING=20091
+
+BRIDGE_IGNORE_EXPRESSWAY_TAGS=false
+BRIDGE_EXPRESSWAY_PREFIXES="534D43,454153,EE,77,ED,EC,SMC,EASY"
+BRIDGE_EXPRESSWAY_BUFFER_MS=1000
 
 # Empty means: derive it from the subnet this box sits on.
 LAN_CIDR=
@@ -614,6 +620,7 @@ write_server_env() {
         echo "RESEND_FROM_EMAIL=$RESEND_FROM_EMAIL"
         [[ -n $RESEND_VERIFY_TEMPLATE_ID ]] && echo "RESEND_VERIFY_TEMPLATE_ID=$RESEND_VERIFY_TEMPLATE_ID"
         echo "RESEND_EAGLE_CEMENT_TEMPLATE_ID=$RESEND_EAGLE_CEMENT_TEMPLATE_ID"
+        echo "RESEND_BAN_ALERT_TEMPLATE_ID=${RESEND_BAN_ALERT_TEMPLATE_ID:-banned-truck-alert}"
         echo "TRANSACTION_ALERT_RECIPIENTS=$TRANSACTION_ALERT_RECIPIENTS"
         echo
         echo "OCR_SPACE_API_KEY=${OCR_SPACE_API_KEY:-null}"
@@ -668,9 +675,10 @@ session.max.ms=$BRIDGE_SESSION_MAX_MS
 
 log.raw=$BRIDGE_LOG_RAW
 
-# Expressway / Tollway tag filtering (Autosweep: 534D43/EE/ED/EC, Easytrip: 454153/77)
-ignore.expressway.tags=true
-expressway.prefixes=534D43,454153,EE,77,ED,EC
+# Expressway / Tollway tag handling (Autosweep: 534D43/EE/ED/EC/SMC, Easytrip: 454153/77/EASY)
+ignore.expressway.tags=${BRIDGE_IGNORE_EXPRESSWAY_TAGS:-false}
+expressway.prefixes=${BRIDGE_EXPRESSWAY_PREFIXES:-534D43,454153,EE,77,ED,EC,SMC,EASY}
+expressway.buffer.ms=${BRIDGE_EXPRESSWAY_BUFFER_MS:-1000}
 EOF
     chown "$SVC_USER:$SVC_USER" "$propfile"
     chmod 600 "$propfile"
@@ -696,7 +704,7 @@ server {
     access_log /var/log/nginx/eagle-cement-$INST.access.log;
     error_log  /var/log/nginx/eagle-cement-$INST.error.log;
 
-    location /api/ {
+    location ^~ /api/ {
         proxy_pass http://127.0.0.1:$API_PORT;
         proxy_http_version 1.1;
         proxy_set_header Host              \$host;
@@ -706,7 +714,7 @@ server {
         proxy_read_timeout 120s;
     }
 
-    location /uploads/ {
+    location ^~ /uploads/ {
         proxy_pass http://127.0.0.1:$API_PORT;
         proxy_set_header Host \$host;
     }
@@ -820,6 +828,7 @@ write_go2rtc_config() {
         echo "CCTV_DOME_URL=$CCTV_DOME_URL"
         echo "CCTV_FACE_URL=$CCTV_FACE_URL"
         echo "CCTV_PLATE_URL=$CCTV_PLATE_URL"
+        echo "CCTV_PLATE_HD_URL=${CCTV_PLATE_HD_URL:-$CCTV_PLATE_URL}"
     } > "$envfile"
     chown "$SVC_USER:$SVC_USER" "$envfile"
     chmod 600 "$envfile"          # the RTSP URLs carry the camera passwords
@@ -842,6 +851,10 @@ streams:
   gate_plate:
     - "\${CCTV_PLATE_URL}"
     - "ffmpeg:\${CCTV_PLATE_URL}#video=h264"
+
+  # Gate License Plate HD (4K for high-res snapshots / OCR)
+  gate_plate_hd:
+    - "\${CCTV_PLATE_HD_URL}"
 
 api:
   listen: ":1984"
