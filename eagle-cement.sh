@@ -704,6 +704,16 @@ server {
     access_log /var/log/nginx/eagle-cement-$INST.access.log;
     error_log  /var/log/nginx/eagle-cement-$INST.error.log;
 
+    location ^~ /go2rtc/ {
+        proxy_pass http://127.0.0.1:1984/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+
     location ^~ /api/ {
         proxy_pass http://127.0.0.1:$API_PORT;
         proxy_http_version 1.1;
