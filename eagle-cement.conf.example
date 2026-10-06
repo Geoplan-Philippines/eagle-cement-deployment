@@ -20,7 +20,7 @@
 #         staging run a newer commit than prod.
 SOURCE_MODE=local
 
-SRC_ROOT=/home/kukaass/Documents/Geoplan/eagle-cement
+SRC_ROOT=/home/user/eagle-cement
 
 GIT_REF_PROD=main
 GIT_REF_STAGING=main
@@ -29,7 +29,6 @@ GIT_URL_SERVER=git@github.com:Geoplan-Philippines/rfid-based-authorization-serve
 GIT_URL_CLIENT=git@github.com:Geoplan-Philippines/rfid-based-authorization-client.git
 GIT_URL_BRIDGE=git@github.com:Geoplan-Philippines/rfid-bridge.git
 GIT_URL_CAMERA=git@github.com:Geoplan-Philippines/camera-access.git
-GIT_URL_ANPR=git@github.com:Geoplan-Philippines/anpr-service.git
 
 # --- where it gets installed ------------------------------------------------
 APP_ROOT=/opt/eagle-cement
@@ -81,11 +80,12 @@ JWT_SECRET_STAGING=
 # Resend (transactional email). The server refuses to boot if these are empty,
 # so placeholders are written when you leave them blank — mail will just fail
 # at send time until you put real values here and re-run `init`.
-RESEND_API_KEY=null
-RESEND_FROM_EMAIL="System <onboarding@resend.dev>"
+RESEND_API_KEY=re_sampleApiKeyPlaceholder12345
+RESEND_FROM_EMAIL="System <noreply@example.com>"
 RESEND_VERIFY_TEMPLATE_ID=
-RESEND_EAGLE_CEMENT_TEMPLATE_ID=eagle-cement
-TRANSACTION_ALERT_RECIPIENTS=operations@geosense.biz
+RESEND_EAGLE_CEMENT_TEMPLATE_ID=transactions
+RESEND_BAN_ALERT_TEMPLATE_ID=banned-truck-alert
+TRANSACTION_ALERT_RECIPIENTS=alerts@example.com,operator@example.com
 
 # OCR.space key used by the plate-reading flow. Placeholder until you have one.
 OCR_SPACE_API_KEY=null
@@ -95,7 +95,7 @@ OCR_SPACE_API_KEY=null
 BRIDGE_FRAME_FORMAT=AUTO_DETECT
 # Quiet time (ms) with no reads before a tag's presence-session closes. One
 # session = one POST = one backend transaction.
-BRIDGE_SESSION_GAP_MS=120000
+BRIDGE_SESSION_GAP_MS=8000
 # Force-close a session this long after it opened. 0 = disabled.
 BRIDGE_SESSION_MAX_MS=0
 # Log every raw byte chunk. Useful while commissioning, noisy afterwards.
@@ -110,6 +110,12 @@ BRIDGE_LOG_RAW_STAGING=true
 BRIDGE_UI_EXPOSE=no
 BRIDGE_UI_PORT_PROD=20090
 BRIDGE_UI_PORT_STAGING=20091
+
+# Expressway / Tollway tag handling (Autosweep & Easytrip)
+# Set to true to drop expressway tags at the bridge; false to forward to backend.
+BRIDGE_IGNORE_EXPRESSWAY_TAGS=false
+BRIDGE_EXPRESSWAY_PREFIXES="534D43,454153,EE,77,ED,EC,SMC,EASY"
+BRIDGE_EXPRESSWAY_BUFFER_MS=1000
 
 # --- camera stack (go2rtc + ANPR) -------------------------------------------
 # Shared by both instances, exactly like BRIDGE_PORT and for the same reason:
@@ -126,12 +132,11 @@ BRIDGE_UI_PORT_STAGING=20091
 # ANPR_CONTINUOUS_ENABLED=false so their plate workers stay quiet.
 CAMERA_ENABLED=yes
 
-# RTSP sources, one per view. Channel 101 is the HD main stream on Hikvision;
-# 102 is the lower-resolution substream. These carry the camera password, so the
-# generated .env is mode 600.
-CCTV_DOME_URL="rtsp://admin:password@192.168.100.134:554/Streaming/Channels/101"
-CCTV_FACE_URL="rtsp://admin:password@192.168.100.134:554/Streaming/Channels/101"
-CCTV_PLATE_URL="rtsp://admin:password@192.168.100.134:554/Streaming/Channels/101"
+# RTSP sources, one per view.
+CCTV_DOME_URL="rtsp://admin:password@192.168.1.101:554/cam/realmonitor?channel=1&subtype=0"
+CCTV_FACE_URL="rtsp://admin:password@192.168.1.102:554/cam/realmonitor?channel=1&subtype=0"
+CCTV_PLATE_URL="rtsp://admin:password@192.168.1.103:554/cam/realmonitor?channel=1&subtype=0"
+CCTV_PLATE_HD_URL="rtsp://admin:password@192.168.1.103:554/cam/realmonitor?channel=1&subtype=0"
 
 # All four camera ports are published on 0.0.0.0, so any machine on the plant
 # LAN can reach them: go2rtc's dashboard on GO2RTC_API_PORT, its republished
@@ -181,9 +186,18 @@ ANPR_UPLOAD_INSTANCE=prod
 # so this is the camera's equivalent of 'bridge-switch': leave staging off
 # unless you deliberately want it reading the gate instead of prod.
 ANPR_CONTINUOUS_PROD=true
-ANPR_CONTINUOUS_STAGING=false
 ANPR_STREAM_ID=gate_plate
 ANPR_POLL_INTERVAL_MS=1500
+
+# --- barrier trigger (camera alarm out relay) --------------------------------
+# Dahua barrier triggered by shorting OPEN to GND via the ANPR plate camera's
+# ALARM_OUT (Brown) and ALARM_OUT_GND (Green) wires.
+BARRIER_CAMERA_HOST=192.168.1.103
+BARRIER_CAMERA_PORT=80
+BARRIER_CAMERA_USER=admin
+BARRIER_CAMERA_PASSWORD=password
+BARRIER_TRIGGER_ENABLED=true
+BARRIER_PULSE_DURATION_MS=3000
 
 # --- firewall ---------------------------------------------------------------
 # CIDR allowed to reach the LAN-facing ports when `firewall` runs. Left empty,
